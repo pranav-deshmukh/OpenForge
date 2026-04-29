@@ -1,4 +1,4 @@
-# PhD Agent
+# OpenForge
 
 A self learning and improving autonomous AI research agent designed to assist with complex research tasks, code execution, debugging, and building new stuff. Built with a skill-based architecture.
 
