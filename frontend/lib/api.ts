@@ -32,6 +32,29 @@ export function getTaskMemory(taskId: string): Promise<MemoryEntry[]> {
   return request<MemoryEntry[]>(`/tasks/${taskId}/memory`);
 }
 
+export function getAllMemory(): Promise<MemoryEntry[]> {
+  return request<MemoryEntry[]>("/memory");
+}
+
+export function getSkills(): Promise<any[]> {
+  return request<any[]>("/skills");
+}
+
+export function getWorkspaceFiles(): Promise<any[]> {
+  return request<any[]>("/workspace/files");
+}
+
+export function getWorkspaceFileContent(filePath: string): Promise<{ content: string }> {
+  return request<{ content: string }>(`/workspace/file?path=${encodeURIComponent(filePath)}`);
+}
+
+export function createSkill(name: string, description: string, instructions: string): Promise<any> {
+  return request<any>("/skills", {
+    method: "POST",
+    body: JSON.stringify({ name, description, instructions }),
+  });
+}
+
 export function createResearchTask(goal: string): Promise<Task> {
   return request<Task>("/tasks", {
     method: "POST",

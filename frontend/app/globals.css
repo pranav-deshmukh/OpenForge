@@ -1,52 +1,80 @@
 @import "tailwindcss";
 
 :root {
-  --background: #0a0a0a;
-  --foreground: #e6e6f0;
+  --bg-base: #080808;
+  --bg-surface: #0f0f0f;
+  --bg-elevated: #161616;
+  --bg-border: #222222;
+
+  --text-primary: #f0f0f0;
+  --text-secondary: #888888;
+  --text-dim: #444444;
+
+  --accent-purple: #7c3aed;
+  --accent-blue: #2563eb;
+  --accent-green: #16a34a;
+  --accent-red: #dc2626;
+  --accent-yellow: #ca8a04;
+  --accent-orange: #ea580c;
+
+  --glow-purple: 0 0 20px rgba(124, 58, 237, 0.3);
+  --glow-green: 0 0 20px rgba(22, 163, 74, 0.3);
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-bg-base: var(--bg-base);
+  --color-bg-surface: var(--bg-surface);
+  --color-bg-elevated: var(--bg-elevated);
+  --color-bg-border: var(--bg-border);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-dim: var(--text-dim);
+
+  --color-accent-purple: var(--accent-purple);
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-green: var(--accent-green);
+  --color-accent-red: var(--accent-red);
+  --color-accent-yellow: var(--accent-yellow);
+  --color-accent-orange: var(--accent-orange);
+
   --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-inter), system-ui, sans-serif;
 }
 
-.surface-card {
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  background: linear-gradient(
-    180deg,
-    rgba(30, 30, 42, 0.52),
-    rgba(17, 17, 24, 0.72)
-  );
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+@keyframes pulse-opacity {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }
 
-.memory-markdown {
-  color: #d9dbe6;
-  line-height: 1.6;
+.animate-pulse-opacity {
+  animation: pulse-opacity 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
-.memory-markdown p {
-  margin-top: 0.5rem;
-  margin-bottom: 0.5rem;
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
 }
-
-.memory-markdown pre {
-  overflow-x: auto;
-  border-radius: 0.5rem;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(0, 0, 0, 0.35);
-  padding: 0.75rem;
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
 }
-
-.memory-markdown code {
-  font-size: 0.9em;
+::-webkit-scrollbar-thumb {
+  background: var(--bg-border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
 }
 
 .memory-markdown ul,

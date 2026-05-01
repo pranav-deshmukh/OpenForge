@@ -2,6 +2,11 @@ import Database from 'better-sqlite3';
 import { v4 as uuid } from 'uuid';
 import type { Task, MemoryEntry } from './types.js';
 
+let ioInstance: any = null;
+export function setIo(io: any) {
+  ioInstance = io;
+}
+
 const db = new Database('phd-agent.db');
 
 db.exec(`
@@ -53,6 +58,10 @@ export function createTask(goal: string): Task {
 export function updateTask(id: string, updates: Partial<Task>) {
   const fields = Object.keys(updates).map(k => `${k} = @${k}`).join(', ');
   db.prepare(`UPDATE tasks SET ${fields} WHERE id = @id`).run({ ...updates, id });
+  const updatedTask = getTask(id);
+  if (updatedTask && ioInstance) {
+    ioInstance.emit('task:update', updatedTask);
+  }
 }
 
 export function getTask(id: string): Task | null {
@@ -80,6 +89,15 @@ export function saveMemory(taskId: string, type: MemoryEntry['type'], content: s
     INSERT INTO memory (id, taskId, type, content, createdAt)
     VALUES (@id, @taskId, @type, @content, @createdAt)
   `).run(entry);
+  
+  if (ioInstance) {
+    ioInstance.emit('task:memory', entry);
+    // also emit the specific agent events as requested in prompt.md
+    if (type === 'thought') ioInstance.emit('agent:thought', entry);
+    if (type === 'code' || type === 'command') ioInstance.emit('agent:command', entry);
+    if (type === 'output') ioInstance.emit('agent:output', entry);
+  }
+  
   return entry;
 }
 

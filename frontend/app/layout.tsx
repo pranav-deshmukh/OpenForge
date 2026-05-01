@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
 const inter = Inter({
@@ -7,9 +7,14 @@ const inter = Inter({
   subsets: ["latin"],
 });
 
+const jetbrainsMono = JetBrains_Mono({
+  variable: "--font-jetbrains-mono",
+  subsets: ["latin"],
+});
+
 export const metadata: Metadata = {
-  title: "PHD Agent Interface",
-  description: "Unified interface for the PhD AI Agent",
+  title: "OpenForge Mission Control",
+  description: "24/7 autonomous AI agent operations",
 };
 
 export default function RootLayout({
@@ -18,8 +23,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${inter.variable} h-full antialiased`}>
-      <body className="min-h-full font-sans">{children}</body>
+    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable} h-full antialiased`}>
+      <body className="min-h-full font-sans bg-bg-base text-text-primary selection:bg-accent-purple selection:text-white">
+        {children}
+      </body>
     </html>
   );
 }
