@@ -98,7 +98,7 @@ export default function FeedPage() {
           
           <div className="flex items-center gap-4 text-xs ml-auto">
             <div className="text-text-dim">
-              Iteration {activeTask?.iteration || 0} / 30
+              Iteration {activeTask?.iterations || 0} / 30
             </div>
             <div className={`font-bold flex items-center gap-1 ${isRunning ? 'text-accent-red animate-pulse-opacity' : 'text-text-dim'}`}>
               ●REC

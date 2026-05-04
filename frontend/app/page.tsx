@@ -63,7 +63,7 @@ export default function DashboardPage() {
   }, []);
 
   const total = tasks.length;
-  const done = tasks.filter(t => t.status === "completed").length;
+  const done = tasks.filter(t => t.status === "done").length;
   const failed = tasks.filter(t => t.status === "failed").length;
 
   return (
