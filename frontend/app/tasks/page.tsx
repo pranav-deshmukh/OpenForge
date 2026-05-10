@@ -116,7 +116,7 @@ export default function TasksPage() {
                     
                     {isExpanded && (
                       <div className="px-4 pb-4 w-full">
-                        <div className="bg-bg-base border border-bg-border p-4 max-h-[400px] overflow-y-auto flex flex-col gap-2 rounded-sm shadow-inner">
+                        <div className="bg-bg-base border border-bg-border p-4 max-h-[400px] overflow-y-auto flex flex-col gap-2 rounded-sm shadow-inner mb-4">
                           {expandedMemory.length === 0 ? (
                             <div className="text-text-dim font-mono text-xs">No memory entries yet.</div>
                           ) : (
@@ -126,10 +126,11 @@ export default function TasksPage() {
                                 mem.type === 'command' ? 'border-accent-blue bg-accent-blue/5 text-accent-blue' :
                                 mem.type === 'output' ? 'border-text-dim bg-white/5 text-text-secondary' :
                                 mem.type === 'error' ? 'border-accent-red bg-accent-red/5 text-accent-red' :
+                                mem.type === 'input' ? 'border-accent-green bg-accent-green/5 text-accent-green' :
                                 'border-text-dim bg-white/5 text-text-secondary'
                               }`}>
                                 <div className="font-semibold uppercase tracking-wider mb-2 opacity-80">
-                                  {mem.type === 'thought' ? '◈ THOUGHT' : mem.type === 'command' ? '$ COMMAND' : mem.type === 'error' ? '⚠ ERROR' : 'OUTPUT'}
+                                  {mem.type === 'thought' ? '◈ THOUGHT' : mem.type === 'command' ? '$ COMMAND' : mem.type === 'error' ? '⚠ ERROR' : mem.type === 'input' ? '👤 USER INPUT' : 'OUTPUT'}
                                 </div>
                                 <div className="whitespace-pre-wrap font-mono break-words">
                                   {mem.content || mem.thought || mem.command || mem.output || '(empty)'}
@@ -138,6 +139,40 @@ export default function TasksPage() {
                             ))
                           )}
                         </div>
+                        
+                        {task.status === 'running' && (
+                          <form 
+                            className="flex gap-2"
+                            onSubmit={async (e) => {
+                              e.preventDefault();
+                              const form = e.target as HTMLFormElement;
+                              const input = form.elements.namedItem('content') as HTMLInputElement;
+                              const content = input.value.trim();
+                              if (!content) return;
+                              try {
+                                await api.sendTaskInput(task.id, content);
+                                input.value = '';
+                                const mem = await api.getTaskMemory(task.id);
+                                setExpandedMemory(mem || []);
+                              } catch (err) {
+                                alert("Failed to send input");
+                              }
+                            }}
+                          >
+                            <input 
+                              name="content"
+                              placeholder="Type a message or answer for the agent..."
+                              className="flex-1 bg-bg-surface border border-bg-border px-3 py-2 text-xs font-mono text-text-primary focus:outline-none focus:border-accent-purple"
+                              autoFocus
+                            />
+                            <button 
+                              type="submit"
+                              className="px-4 py-2 bg-accent-purple text-white text-[10px] font-mono font-bold uppercase tracking-wider"
+                            >
+                              SEND
+                            </button>
+                          </form>
+                        )}
                       </div>
                     )}
                   </div>

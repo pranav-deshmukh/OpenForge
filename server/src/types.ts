@@ -15,7 +15,7 @@ export interface Task {
 export interface MemoryEntry {
   id: string;
   taskId: string;
-  type: 'research' | 'finding' | 'summary' | 'code' | 'output' | 'error' | 'thought';
+  type: 'research' | 'finding' | 'summary' | 'code' | 'output' | 'error' | 'thought' | 'input';
   content: string;
   createdAt: number;
 }

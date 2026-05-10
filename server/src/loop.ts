@@ -1,52 +1,64 @@
 import { callLLM } from './agent.js';
 import { ensureWorkspaceReady, execInContainer } from './shell.js';
 import { buildSkillCatalog, discoverSkills } from './skills.js';
-import { saveMemory, updateTask } from './memory.js';
+import { saveMemory, updateTask, getAllTasks, getMemoryForTask } from './memory.js';
 import type { Message, Task } from './types.js';
 
-function buildSystemPrompt(skillCatalog: string): string {
-  return `You are an autonomous PhD-level AI agent running inside a Linux container.
-You have FULL shell access to the container. You can install anything, run anything, create files, and start servers.
+function buildSystemPrompt(skillCatalog: string, pastContext: string): string {
+  return `You are an autonomous, PhD-level AI researcher and software engineer.
+You operate continuously to solve complex problems, build software, and conduct research.
+You do NOT just execute simple commands. You think and act like a human researcher:
+1. You search the internet and literature for information.
+2. You read documentation, papers, and code.
+3. You design architectures and write implementation code.
+4. You CREATE TESTS for your code, run them, and evaluate the results empirically.
+5. You iterate, debug, and refine until the results are completely satisfactory.
 
-## Your available skills
+Today's date and time is: ${new Date().toISOString()}
 
+## Your Environment
+You are running inside a persistent Linux container with FULL root shell access.
+You can install any tools (apt, pip, npm), start servers, create files, and write scripts.
+
+## Memory & Knowledge (CRITICAL)
+You have a persistent directory at \`/workspace/\`. 
+You MUST manage your own long-term memory like a human would:
+- Create a \`/workspace/knowledge/\` directory to store your research notes, architecture designs, and learned facts.
+- Create a \`/workspace/journal/\` directory to log your daily progress and thoughts (e.g., "What I did on May 6th").
+- Before starting a complex task, read your past journals and knowledge files to recall what you already know.
+- You are expected to search your own \`/workspace/\` using \`grep\` or \`find\` to recall past information.
+
+${pastContext}
+
+## Pre-installed Skills
+You have access to some helper scripts. Read them before using:
 ${skillCatalog}
 
-## How to use skills
-
-When you need a skill, read it first:
-cat /skills/<skill-name>/SKILL.md
-Then follow its instructions exactly.
-
-## How you work
-
-At each iteration you decide ONE shell command to run next.
-You respond in this exact JSON format only:
+## How you operate
+At each iteration, you decide on ONE shell command to advance your goal. 
+Respond ONLY in this exact JSON format:
 
 {
-  "thought": "what you're thinking and why",
-  "command": "the exact shell command to run",
+  "thought": "Analyze your previous output, reflect on the goal, consult your memory/plans, and explain what you will do next.",
+  "command": "The exact shell command to execute.",
   "done": false
 }
 
-When the goal is fully complete:
+If you need clarification from the user, you can set the command to "ask_user" and explain your question in the thought. The loop will then pause and wait for the user to provide input via the dashboard.
+
+When you have EXHAUSTIVELY tested your solution and are 100% satisfied with the results:
 {
-  "thought": "goal is complete because...",
+  "thought": "Final reflection on the completed goal.",
   "command": "",
   "done": true,
-  "summary": "what was achieved and where files are"
+  "summary": "A detailed summary of what was built, where it is located, what knowledge was saved, and how it was tested."
 }
 
 ## Rules
-
-- Run ONE command per iteration
-- Read a skill before using it
-- Install packages if needed (apt-get, pip, npm)
-- Write files to /workspace/
-- If a command fails, read the error and fix it
-- Keep going until the goal is truly done
-- You can start servers, they will keep running
-- NEVER give up`;
+- NEVER give up. If an approach fails, diagnose why, read the errors, and try a new approach.
+- ALWAYS write tests to verify your code. Do not assume your code works.
+- Think long-term. Build robust, well-documented solutions.
+- Run ONE command per iteration. Wait for the output.`;
 }
 
 export async function runAutonomousLoop(task: Task): Promise<void> {
@@ -60,16 +72,43 @@ export async function runAutonomousLoop(task: Task): Promise<void> {
   const skillCatalog = buildSkillCatalog(skills);
   console.log(`[Loop] Loaded ${skills.length} skills`);
 
-  const systemPrompt = buildSystemPrompt(skillCatalog);
-  const maxIterations = 30;
+  // Build past context from previous tasks
+  const pastTasks = getAllTasks()
+    .filter(t => t.status === 'done' && t.id !== task.id)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 5);
+    
+  let pastContext = '';
+  if (pastTasks.length > 0) {
+    pastContext = '## Recent Past Tasks (Context)\n' + pastTasks.map(t => 
+      `- [${new Date(t.createdAt).toISOString()}] Goal: ${t.goal}\n  Result: ${t.result}`
+    ).join('\n');
+  }
+
+  const systemPrompt = buildSystemPrompt(skillCatalog, pastContext);
+  const maxIterations = 200; // Significantly increased for deep autonomy
   const conversationHistory: Message[] = [];
+  let lastProcessedInputTime = Date.now();
 
   conversationHistory.push({
     role: 'user',
-    content: `Goal: ${task.goal}\n\nStart working on this. What is your first command?`,
+    content: `Goal: ${task.goal}\n\nStart working on this. Set up your knowledge/journal directories if needed, plan your approach, and give me your first command.`,
   });
 
   for (let i = 1; i <= maxIterations; i++) {
+    // Check for new user input before calling LLM
+    const newInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+    if (newInputs.length > 0) {
+      console.log(`[Loop] Received ${newInputs.length} new user inputs`);
+      for (const input of newInputs) {
+        conversationHistory.push({
+          role: 'user',
+          content: `USER INPUT: ${input.content}`,
+        });
+        if (input.createdAt > lastProcessedInputTime) lastProcessedInputTime = input.createdAt;
+      }
+    }
+
     console.log(`\n[Loop] Iteration ${i}/${maxIterations}`);
     updateTask(task.id, { iterations: i });
 
@@ -126,6 +165,27 @@ export async function runAutonomousLoop(task: Task): Promise<void> {
     }
 
     const command = decision.command?.trim();
+    
+    // Handle ask_user specifically
+    if (command === 'ask_user') {
+      console.log('[Loop] Agent is waiting for user input...');
+      saveMemory(task.id, 'thought', `WAITING FOR USER: ${decision.thought}`);
+      
+      // Wait for new input
+      let waiting = true;
+      while (waiting) {
+        await new Promise(r => setTimeout(r, 5000));
+        const checkInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+        if (checkInputs.length > 0) {
+          waiting = false;
+          // Inputs will be picked up at the start of next iteration
+          i--; // Don't count the waiting as an iteration
+          break;
+        }
+      }
+      continue;
+    }
+
     if (!command) {
       conversationHistory.push({ role: 'assistant', content: raw });
       conversationHistory.push({
@@ -158,8 +218,10 @@ export async function runAutonomousLoop(task: Task): Promise<void> {
       content: `Command output (exit ${result.exitCode}):\n${output}\n\nWhat is your next command?`,
     });
 
-    if (conversationHistory.length > 40) {
-      conversationHistory.splice(0, 2);
+    // Keep memory bounded but large enough for context
+    if (conversationHistory.length > 50) {
+      // Remove oldest turns, but keep the initial goal instruction
+      conversationHistory.splice(1, 2);
     }
   }
 

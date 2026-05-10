@@ -68,3 +68,10 @@ export function createBuilderTask(goal: string): Promise<Task> {
     body: JSON.stringify({ goal }),
   });
 }
+
+export function sendTaskInput(taskId: string, content: string): Promise<MemoryEntry> {
+  return request<MemoryEntry>(`/tasks/${taskId}/input`, {
+    method: "POST",
+    body: JSON.stringify({ content }),
+  });
+}

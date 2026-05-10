@@ -33,6 +33,13 @@ app.post('/tasks', (req, res) => {
   res.json(task);
 });
 
+app.post('/tasks/:id/input', (req, res) => {
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ error: 'content is required' });
+  const entry = saveMemory(req.params.id, 'input', content);
+  res.json(entry);
+});
+
 app.get('/tasks', (_req, res) => res.json(getAllTasks()));
 app.get('/tasks/:id', (req, res) => {
   const task = getTask(req.params.id);
