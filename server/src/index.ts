@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import { createTask, getAllTasks, getTask, getMemoryForTask, setIo } from './memory.js';
+import { createTask, getAllTasks, getTask, getMemoryForTask, setIo, saveMemory } from './memory.js';
 import { startQueueWorker } from './queue.js';
 
 const app = express();
