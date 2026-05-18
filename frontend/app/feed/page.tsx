@@ -10,6 +10,7 @@ export default function FeedPage() {
   const [activeTask, setActiveTask] = useState<any>(null);
   const [memories, setMemories] = useState<any[]>([]);
   const [goalInput, setGoalInput] = useState("");
+  const [liveStream, setLiveStream] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const feedContainerRef = useRef<HTMLDivElement>(null);
   const feedEndRef = useRef<HTMLDivElement>(null);
@@ -49,6 +50,12 @@ export default function FeedPage() {
         if (prev.find(m => m.id === memoryItem.id)) return prev;
         return [...prev, memoryItem];
       });
+      // Clear live stream when a formal output/command/thought arrives
+      setLiveStream("");
+    });
+
+    socket.on("agent:stream", (data: { content: string, type: string }) => {
+      setLiveStream((prev) => (prev + data.content).slice(-2000));
     });
 
     return () => {
@@ -61,21 +68,31 @@ export default function FeedPage() {
     if (autoScroll) {
       feedEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [memories, autoScroll]);
+  }, [memories, liveStream, autoScroll]);
 
-  const deployTask = async () => {
+  const handleSubmit = async () => {
     if (!goalInput.trim()) return;
-    try {
-      const res = await fetch("http://localhost:3000/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ goal: goalInput })
-      });
-      const t = await res.json();
-      setGoalInput("");
-      setActiveTask(t);
-      setMemories([]);
-    } catch(err) {}
+    
+    if (activeTask && activeTask.status === "running") {
+      // Send input to running task
+      try {
+        await api.sendTaskInput(activeTask.id, goalInput);
+        setGoalInput("");
+      } catch (err) {}
+    } else {
+      // Deploy new task
+      try {
+        const res = await fetch("http://localhost:3000/tasks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ goal: goalInput })
+        });
+        const t = await res.json();
+        setGoalInput("");
+        setActiveTask(t);
+        setMemories([]);
+      } catch(err) {}
+    }
   };
 
   const isRunning = activeTask?.status === "running";
@@ -104,34 +121,7 @@ export default function FeedPage() {
       <div className="flex flex-col h-[calc(100vh-48px)] w-full relative bg-bg-base overflow-hidden">
         
         {/* HEADER */}
-        <div className="h-14 border-b border-bg-border bg-bg-surface flex items-center justify-between px-6 sticky top-0 z-10 font-mono">
-          <div className="flex items-center gap-6 overflow-hidden">
-            <Link href="/" className="text-text-dim hover:text-text-primary transition-colors flex items-center gap-2 group">
-              <span className="group-hover:-translate-x-1 transition-transform">←</span> 
-              <span className="hidden sm:inline">DASHBOARD</span>
-            </Link>
-            <div className="h-4 w-[1px] bg-bg-border hidden sm:block"></div>
-            {activeTask ? (
-              <div className="flex items-center gap-3 truncate max-w-md">
-                <span className="text-accent-purple text-[10px] font-bold tracking-widest border border-accent-purple/30 px-1.5 py-0.5 rounded">ACTIVE</span>
-                <span className="text-text-primary text-xs truncate font-medium">"{activeTask.goal}"</span>
-              </div>
-            ) : (
-              <span className="text-text-dim text-xs tracking-widest">NO ACTIVE MISSION</span>
-            )}
-          </div>
-          
-          <div className="flex items-center gap-6 text-[10px] font-bold">
-            <div className="flex items-center gap-2">
-              <span className="text-text-dim tracking-widest uppercase">ITERATIONS</span>
-              <span className="text-text-primary tabular-nums border border-bg-border px-2 py-0.5 bg-bg-base">{activeTask?.iterations || 0}</span>
-            </div>
-            <div className={`flex items-center gap-2 px-3 py-1 border rounded-sm transition-colors ${isRunning ? 'border-accent-orange/30 bg-accent-orange/5 text-accent-orange' : 'border-bg-border text-text-dim'}`}>
-              <div className={`w-1.5 h-1.5 rounded-full ${isRunning ? 'bg-accent-orange animate-pulse' : 'bg-text-dim'}`}></div>
-              <span className="tracking-[2px] uppercase">{isRunning ? 'LIVE' : 'IDLE'}</span>
-            </div>
-          </div>
-        </div>
+        {/* ... (no changes here) ... */}
 
         {/* FEED CONTAINER */}
         <div 
@@ -203,12 +193,30 @@ export default function FeedPage() {
               </div>
             </div>
           ))}
+
+          {/* LIVE TERMINAL STREAM */}
+          {liveStream && (
+            <div className="flex flex-col gap-3 animate-pulse">
+               <div className="border border-text-dim/20 rounded flex flex-col transition-all duration-300 bg-black/40">
+                  <div className="flex justify-between items-center px-4 py-2 border-b border-inherit/20 text-[9px] font-bold tracking-[2px] uppercase text-text-dim">
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg leading-none mt-[-2px]">▶</span>
+                      <span>LIVE STREAM</span>
+                    </div>
+                  </div>
+                  <div className="p-4 text-[12px] leading-snug text-text-secondary font-mono whitespace-pre-wrap">
+                    {liveStream}
+                  </div>
+               </div>
+            </div>
+          )}
+
           <div ref={feedEndRef} />
         </div>
 
         {/* BOTTOM INPUT BAR */}
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-[90%] max-w-3xl flex flex-col gap-2 z-20">
-          {!autoScroll && memories.length > 0 && (
+          {!autoScroll && (memories.length > 0 || liveStream) && (
             <button 
               onClick={() => setAutoScroll(true)}
               className="mx-auto mb-2 px-4 py-1.5 bg-accent-purple text-white text-[10px] font-bold tracking-widest uppercase rounded-full shadow-lg hover:scale-105 transition-transform"
@@ -220,17 +228,17 @@ export default function FeedPage() {
             <input 
               type="text"
               className="flex-1 bg-transparent text-text-primary px-6 outline-none font-mono text-sm placeholder-text-dim"
-              placeholder="Deploy a new mission..."
+              placeholder={isRunning ? "Provide feedback or 'approve'..." : "Deploy a new mission..."}
               value={goalInput}
               onChange={(e) => setGoalInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && deployTask()}
+              onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
             />
             <button 
-              onClick={deployTask}
+              onClick={handleSubmit}
               disabled={!goalInput.trim()}
               className="px-8 bg-accent-purple text-white font-mono uppercase tracking-[2px] text-xs font-bold hover:bg-opacity-90 disabled:bg-text-dim disabled:cursor-not-allowed transition-all active:scale-95"
             >
-              Deploy
+              {isRunning ? "SEND" : "Deploy"}
             </button>
           </div>
         </div>

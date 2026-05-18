@@ -49,6 +49,17 @@ app.get('/tasks/:id', (req, res) => {
 app.get('/tasks/:id/memory', (req, res) => {
   res.json(getMemoryForTask(req.params.id));
 });
+
+import { getSubTasksForTask, getArtifactsForTask } from './memory.js';
+
+app.get('/tasks/:id/subtasks', (req, res) => {
+  res.json(getSubTasksForTask(req.params.id));
+});
+
+app.get('/tasks/:id/artifacts', (req, res) => {
+  res.json(getArtifactsForTask(req.params.id));
+});
+
 import { getAllMemory } from './memory.js';
 import { discoverSkills } from './skills.js';
 import fs from 'fs/promises';

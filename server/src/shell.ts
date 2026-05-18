@@ -10,6 +10,8 @@ export interface ShellResult {
   exitCode: number;
 }
 
+import { getIo } from './memory.js';
+
 export async function execInContainer(
   command: string,
   timeoutMs = 60000
@@ -22,6 +24,7 @@ export async function execInContainer(
     let stdout = '';
     let stderr = '';
     let settled = false;
+    const io = getIo();
 
     const settle = (result: ShellResult) => {
       if (settled) return;
@@ -29,8 +32,16 @@ export async function execInContainer(
       resolve(result);
     };
 
-    proc.stdout.on('data', (d) => stdout += d.toString());
-    proc.stderr.on('data', (d) => stderr += d.toString());
+    proc.stdout.on('data', (d) => {
+      const chunk = d.toString();
+      stdout += chunk;
+      if (io) io.emit('agent:stream', { content: chunk, type: 'stdout' });
+    });
+    proc.stderr.on('data', (d) => {
+      const chunk = d.toString();
+      stderr += chunk;
+      if (io) io.emit('agent:stream', { content: chunk, type: 'stderr' });
+    });
 
     proc.on('close', (code) => {
       settle({ stdout, stderr, exitCode: code ?? 1 });
@@ -48,19 +59,39 @@ export async function execInContainer(
 }
 
 export async function ensureWorkspaceReady(): Promise<void> {
-  // Check if container already running
+  // 1. Check if container exists and its status
   try {
     const result = await execDockerCommand([
-      'inspect', '-f', '{{.State.Running}}', CONTAINER_NAME
+      'inspect', '-f', '{{.State.Status}}', CONTAINER_NAME
     ]);
-    if (result.stdout.trim() === 'true') {
-      console.log(`[Shell] Workspace container already running`);
+    const status = result.stdout.trim();
+    
+    if (status === 'running') {
+      console.log(`[Shell] Workspace container is already running`);
       return;
     }
-  } catch {}
+    
+    if (status === 'exited' || status === 'created' || status === 'paused') {
+      console.log(`[Shell] Workspace container exists (${status}). Starting...`);
+      await execDockerCommand(['start', CONTAINER_NAME]);
+      return;
+    }
+  } catch (err) {
+    // Container does not exist, proceed to check image
+  }
 
-  // Build image
-  console.log(`[Shell] Building workspace image...`);
+  // 2. Check if the image already exists
+  try {
+    await execDockerCommand(['inspect', WORKSPACE_IMAGE]);
+    console.log(`[Shell] Workspace image found. Starting new container...`);
+    await startContainer();
+    return;
+  } catch (err) {
+    // Image does not exist, must build
+  }
+
+  // 3. Build image if missing
+  console.log(`[Shell] Workspace image not found. Building...`);
 
   const dockerfile = `FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -116,14 +147,23 @@ async function startContainer(): Promise<void> {
 
 // Helper for docker commands that don't need stdin
 function execDockerCommand(args: string[]): Promise<ShellResult> {
+  console.log(`[Shell] $ docker ${args.join(' ')}`);
   return new Promise((resolve, reject) => {
     const proc = spawn('docker', args);
 
     let stdout = '';
     let stderr = '';
 
-    proc.stdout.on('data', (d) => stdout += d.toString());
-    proc.stderr.on('data', (d) => stderr += d.toString());
+    proc.stdout.on('data', (d) => {
+      const chunk = d.toString();
+      stdout += chunk;
+      process.stdout.write(chunk);
+    });
+    proc.stderr.on('data', (d) => {
+      const chunk = d.toString();
+      stderr += chunk;
+      process.stderr.write(chunk);
+    });
 
     proc.on('close', (code) => {
       if (code === 0) resolve({ stdout, stderr, exitCode: 0 });

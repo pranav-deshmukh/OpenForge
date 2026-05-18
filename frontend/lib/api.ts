@@ -1,4 +1,4 @@
-import { MemoryEntry, Task } from "./types";
+import { MemoryEntry, Task, SubTask, Artifact } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
 
@@ -30,6 +30,14 @@ export function getTask(id: string): Promise<Task> {
 
 export function getTaskMemory(taskId: string): Promise<MemoryEntry[]> {
   return request<MemoryEntry[]>(`/tasks/${taskId}/memory`);
+}
+
+export function getSubTasks(taskId: string): Promise<SubTask[]> {
+  return request<SubTask[]>(`/tasks/${taskId}/subtasks`);
+}
+
+export function getArtifacts(taskId: string): Promise<Artifact[]> {
+  return request<Artifact[]>(`/tasks/${taskId}/artifacts`);
 }
 
 export function getAllMemory(): Promise<MemoryEntry[]> {
