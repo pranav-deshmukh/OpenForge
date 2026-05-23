@@ -1,6 +1,8 @@
 import Database from 'better-sqlite3';
 import { v4 as uuid } from 'uuid';
-import type { Task, MemoryEntry, SubTask, Reflection, Artifact } from './types.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import type { Task, MemoryEntry, SubTask, Reflection, Artifact, MemoryLayer } from './types.js';
 
 let ioInstance: any = null;
 export function setIo(io: any) {
@@ -11,6 +13,11 @@ export function getIo() {
 }
 
 const db = new Database('phd-agent.db');
+
+const VAULT_DIR = path.resolve('workspace', 'vault');
+if (!fs.existsSync(VAULT_DIR)) {
+  fs.mkdirSync(VAULT_DIR, { recursive: true });
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS tasks (
@@ -43,6 +50,7 @@ db.exec(`
     retryCount INTEGER DEFAULT 0,
     result TEXT,
     error TEXT,
+    critique TEXT,
     createdAt INTEGER NOT NULL,
     updatedAt INTEGER NOT NULL,
     startedAt INTEGER,
@@ -75,7 +83,9 @@ db.exec(`
     taskId TEXT NOT NULL,
     subTaskId TEXT,
     type TEXT NOT NULL,
+    layer TEXT NOT NULL DEFAULT 'working',
     content TEXT NOT NULL,
+    metadata TEXT,
     createdAt INTEGER NOT NULL,
     FOREIGN KEY (taskId) REFERENCES tasks(id)
   );
@@ -92,7 +102,16 @@ try {
   db.exec(`ALTER TABLE tasks ADD COLUMN successCriteria TEXT`);
 } catch {}
 try {
+  db.exec(`ALTER TABLE subtasks ADD COLUMN critique TEXT`);
+} catch {}
+try {
   db.exec(`ALTER TABLE memory ADD COLUMN subTaskId TEXT`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE memory ADD COLUMN layer TEXT DEFAULT 'working'`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE memory ADD COLUMN metadata TEXT`);
 } catch {}
 
 // Helpers
@@ -111,6 +130,7 @@ function toDbSubTask(subTask: SubTask): any {
     assignedAgent: null,
     result: null,
     error: null,
+    critique: null,
     startedAt: null,
     completedAt: null,
     ...subTask,
@@ -282,20 +302,31 @@ export function getArtifactsForTask(taskId: string): Artifact[] {
 }
 
 // Memory
-export function saveMemory(taskId: string, type: MemoryEntry['type'], content: any, subTaskId?: string): MemoryEntry {
+export function saveMemory(
+  taskId: string, 
+  type: MemoryEntry['type'], 
+  content: any, 
+  subTaskId?: string | null,
+  layer: MemoryLayer = 'working',
+  metadata?: any
+): MemoryEntry {
   const entry: MemoryEntry = {
     id: uuid(),
     taskId,
     subTaskId: subTaskId || null,
     type,
+    layer,
     content: typeof content === 'string' ? content : JSON.stringify(content),
+    metadata: metadata ? (typeof metadata === 'string' ? metadata : JSON.stringify(metadata)) : null,
     createdAt: Date.now(),
   };
   db.prepare(`
-    INSERT INTO memory (id, taskId, subTaskId, type, content, createdAt)
-    VALUES (@id, @taskId, @subTaskId, @type, @content, @createdAt)
+    INSERT INTO memory (id, taskId, subTaskId, type, layer, content, metadata, createdAt)
+    VALUES (@id, @taskId, @subTaskId, @type, @layer, @content, @metadata, @createdAt)
   `).run(entry);
   
+  appendToVault(entry);
+
   if (ioInstance) {
     ioInstance.emit('task:memory', entry);
     if (type === 'thought') ioInstance.emit('agent:thought', entry);
@@ -316,4 +347,26 @@ export function getMemoryForSubTask(subTaskId: string): MemoryEntry[] {
 
 export function getAllMemory(): MemoryEntry[] {
   return db.prepare('SELECT * FROM memory ORDER BY createdAt DESC LIMIT 100').all() as MemoryEntry[];
+}
+
+function appendToVault(entry: MemoryEntry) {
+  const taskDir = path.join(VAULT_DIR, entry.taskId);
+  if (!fs.existsSync(taskDir)) {
+    fs.mkdirSync(taskDir, { recursive: true });
+  }
+
+  const fileName = entry.subTaskId ? `subtask_${entry.subTaskId}.md` : `global.md`;
+  const filePath = path.join(taskDir, fileName);
+
+  const timestamp = new Date(entry.createdAt).toISOString();
+  const mdContent = `\n### [${timestamp}] ${entry.type.toUpperCase()} (${entry.layer})\n${entry.content}\n${entry.metadata ? `\n**Metadata:**\n\`\`\`json\n${entry.metadata}\n\`\`\`\n` : ''}\n---\n`;
+
+  fs.appendFileSync(filePath, mdContent);
+}
+
+export function compressContext(content: string): string {
+  return content
+    .replace(/\s+/g, ' ')
+    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .trim();
 }

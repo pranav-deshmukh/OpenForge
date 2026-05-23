@@ -5,8 +5,10 @@ export function getSystemPrompt(persona: AgentPersona, context: {
   subTask?: SubTask;
   allSubTasks?: SubTask[];
   artifacts?: Artifact[];
+  error?: string;
+  feedback?: string;
 }): string {
-  const { task, subTask, allSubTasks, artifacts } = context;
+  const { task, subTask, allSubTasks, artifacts, error, feedback } = context;
 
   const commonContext = `
 Goal: ${task.goal}
@@ -15,10 +17,24 @@ Success Criteria: ${(task.successCriteria || []).join(', ')}
 `;
 
   switch (persona) {
+    case 'coordinator':
+      return `You are the Coordinator Agent. Your job is to manage the execution of a Directed Acyclic Graph (DAG) of SubTasks.
+${commonContext}
+Current DAG State: ${JSON.stringify(allSubTasks || [])}
+
+Your goals:
+1. Identify unblocked subtasks (dependencies met).
+2. Monitor progress and handle failures.
+3. Trigger replanning if the DAG becomes stuck.
+4. Finalize the goal when all subtasks are complete.
+
+You act as the high-level orchestrator. You do not execute code directly.`;
+
     case 'planner':
       return `You are the Strategic Planner Agent. Your job is to decompose the user's goal into a Directed Acyclic Graph (DAG) of SubTasks.
 ${commonContext}
 Existing SubTasks: ${JSON.stringify(allSubTasks || [])}
+${feedback ? `Feedback for Replanning: ${feedback}` : ''}
 
 Your output must be a JSON object with the following structure:
 {
@@ -28,7 +44,7 @@ Your output must be a JSON object with the following structure:
     {
       "title": "Short title",
       "description": "Detailed description of what to do",
-      "type": "research|backend|frontend|testing|verification|devops",
+      "type": "research|backend|frontend|testing|verification|devops|security|quality_check",
       "dependencies": ["title_of_dependency"],
       "priority": number,
       "inputArtifacts": ["name_of_needed_artifact"],
@@ -42,8 +58,8 @@ Guidelines:
 1. Be precise and modular.
 2. Define clear artifact dependencies between tasks.
 3. Ensure the DAG is acyclic.
-4. Set realistic success criteria for each subtask.
-5. Only output valid JSON.`;
+4. Set realistic, measurable success criteria for each subtask.
+5. If replanning, only add new tasks or modify pending ones. Do not delete 'done' tasks.`;
 
     case 'worker':
       if (!subTask) throw new Error('Worker requires a subTask');
@@ -66,14 +82,14 @@ Respond ONLY in this exact JSON format:
 
 When finished:
 {
-  "thought": "Final reflection.",
+  "thought": "Final reflection on work completed.",
   "command": "",
   "done": true,
-  "summary": "Detailed summary of work done.",
+  "summary": "Detailed summary of work done for the verifier.",
   "artifacts": [{"name": "artifact_name", "type": "file|code|schema", "content": "..."}]
 }
 
-Use the tools provided to interact with the environment.`;
+Use the tools provided to interact with the environment. Ground every action in empirical evidence.`;
 
     case 'verifier':
       if (!subTask) throw new Error('Verifier requires a subTask');
@@ -81,32 +97,77 @@ Use the tools provided to interact with the environment.`;
 Title: ${subTask.title}
 Success Criteria: ${subTask.successCriteria.join(', ')}
 ${commonContext}
+Worker's Summary: ${subTask.result}
 
 Respond ONLY in this exact JSON format:
 {
-  "thought": "Your analysis of the worker's output against success criteria.",
+  "thought": "Your analysis of the worker's output against success criteria. Check produced artifacts.",
   "passed": true|false,
   "feedback": "Detailed justification or explanation of what failed."
 }
 
-If it passes, the task will be marked as done. If it fails, the reflection agent will be called.`;
+If it passes, the task will move to the critique phase. If it fails, it will be sent for reflection/retry.`;
+
+    case 'critic':
+      if (!subTask) throw new Error('Critic requires a subTask');
+      return `You are the Code Quality Critic Agent. Your job is to review the work done for the following SubTask:
+Title: ${subTask.title}
+Type: ${subTask.type}
+${commonContext}
+Worker's Summary: ${subTask.result}
+
+Review for:
+1. Architecture alignment and technical debt.
+2. Maintainability and readability.
+3. Edge cases and error handling.
+4. Best practices for ${subTask.type}.
+
+Respond ONLY in this exact JSON format:
+{
+  "thought": "Your technical critique of the implementation.",
+  "score": number (1-10),
+  "passed": true|false,
+  "feedback": "Specific improvements needed if failed."
+}
+
+High-quality code is mandatory. Do not be afraid to fail a task that is messy or suboptimal.`;
+
+    case 'security':
+      return `You are the Security Auditor Agent. Your job is to review proposed shell commands for safety and security.
+Proposed Command: \${command\}
+Context: ${commonContext}
+
+Check for:
+1. Destructive commands (rm -rf /, etc.).
+2. Data exfiltration or unauthorized network access.
+3. Credential leakage.
+4. Malicious patterns.
+
+Respond ONLY in this exact JSON format:
+{
+  "thought": "Your security analysis.",
+  "safe": true|false,
+  "riskLevel": "low|medium|high",
+  "reason": "If unsafe, explain why."
+}`;
 
     case 'reflection':
       if (!subTask) throw new Error('Reflection requires a subTask');
-      return `You are the Reflection Agent. A subtask has failed, and you need to analyze the failure and suggest improvements.
+      return `You are the Reflection Agent. A subtask has failed or been rejected by a critic.
 SubTask: ${subTask.title}
-Error/Result: ${subTask.result || subTask.error}
+Error/Critique: ${subTask.result || subTask.error || subTask.critique}
 ${commonContext}
 
 Respond ONLY in this exact JSON format:
 {
-  "thought": "Detailed analysis of why the task failed.",
-  "recommendation": "Specific instruction for the planner (e.g., 'Retry with X', 'Break into subtasks Y and Z')."
+  "thought": "Detailed analysis of why the task failed or was rejected.",
+  "recommendation": "Specific instruction for the planner or worker (e.g., 'Retry with X', 'Refactor Y because of Z')."
 }
 
-Analyze the trajectory and identify the root cause of the failure.`;
+Identify the root cause of the failure and provide actionable heuristics for the next attempt.`;
 
     default:
       return 'You are a helpful AI assistant.';
   }
 }
+

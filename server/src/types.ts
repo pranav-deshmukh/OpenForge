@@ -22,7 +22,9 @@ export type SubTaskStatus =
   | 'blocked' 
   | 'retrying' 
   | 'cancelled'
-  | 'waiting_for_human';
+  | 'waiting_for_human'
+  | 'verifying'
+  | 'critiquing';
 
 export type SubTaskType = 
   | 'research'
@@ -32,7 +34,9 @@ export type SubTaskType =
   | 'verification'
   | 'devops'
   | 'planning'
-  | 'reflection';
+  | 'reflection'
+  | 'security'
+  | 'quality_check';
 
 export interface SubTask {
   id: string;
@@ -50,6 +54,7 @@ export interface SubTask {
   retryCount: number;
   result?: string;
   error?: string;
+  critique?: string; // Feedback from critic agents
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -73,18 +78,42 @@ export interface Artifact {
   createdAt: number;
 }
 
-export type AgentPersona = 'planner' | 'worker' | 'verifier' | 'reflection';
+export type AgentPersona = 
+  | 'coordinator' 
+  | 'planner' 
+  | 'worker' 
+  | 'verifier' 
+  | 'critic' 
+  | 'security' 
+  | 'reflection';
+
+export type MemoryType = 
+  | 'research' 
+  | 'finding' 
+  | 'summary' 
+  | 'code' 
+  | 'output' 
+  | 'error' 
+  | 'thought' 
+  | 'input' 
+  | 'command' 
+  | 'critique' 
+  | 'security_alert';
+
+export type MemoryLayer = 'working' | 'episodic' | 'semantic' | 'artifact';
 
 export interface MemoryEntry {
   id: string;
   taskId: string;
-  subTaskId?: string;
-  type: 'research' | 'finding' | 'summary' | 'code' | 'output' | 'error' | 'thought' | 'input' | 'command';
+  subTaskId?: string | null;
+  type: MemoryType;
+  layer: MemoryLayer;
   content: string;
+  metadata?: string; // JSON string for extra context
   createdAt: number;
 }
 
-export type MessageRole = 'user' | 'assistant';
+export type MessageRole = 'user' | 'assistant' | 'system';
 
 export interface Message {
   role: MessageRole;

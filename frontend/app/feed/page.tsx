@@ -168,6 +168,16 @@ export default function FeedPage() {
                     icon = "$";
                     theme = "border-accent-blue/20 text-accent-blue bg-accent-blue/5";
                     content = mem.command || mem.content;
+                  } else if (mem.type === 'critique') {
+                    label = "CRITIQUE";
+                    icon = "✍";
+                    theme = "border-accent-orange/20 text-accent-orange bg-accent-orange/5";
+                    content = mem.content;
+                  } else if (mem.type === 'security_alert') {
+                    label = "SECURITY AUDIT";
+                    icon = "⚠";
+                    theme = "border-accent-red/40 text-accent-red bg-accent-red/10 animate-pulse";
+                    content = mem.content;
                   } else if (mem.type === 'error') {
                     label = "ERROR";
                     icon = "⚠";
