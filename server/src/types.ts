@@ -1,9 +1,12 @@
 export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 
+export type TaskMode = 'chat' | 'tool' | 'autonomous_dag';
+
 export interface Task {
   id: string;
   goal: string;
   status: TaskStatus;
+  mode?: TaskMode;
   createdAt: number;
   startedAt?: number;
   completedAt?: number;
@@ -79,6 +82,9 @@ export interface Artifact {
 }
 
 export type AgentPersona = 
+  | 'router'
+  | 'chat'
+  | 'standalone_worker'
   | 'coordinator' 
   | 'planner' 
   | 'worker' 

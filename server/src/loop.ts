@@ -1,5 +1,11 @@
 import { callLLM } from './agent.js';
-import { ensureWorkspaceReady, execInContainer } from './shell.js';
+import {
+  ensureWorkspaceReady,
+  execInContainer,
+  strReplaceInContainer,
+  readFileFromContainer,
+  insertAtLineInContainer,
+} from "./shell.js";
 import { buildSkillCatalog, discoverSkills } from './skills.js';
 import { 
   saveMemory, updateTask, getTask, getMemoryForTask, 
@@ -11,11 +17,153 @@ import { getSystemPrompt } from './prompts.js';
 import type { Message, Task, SubTask, Artifact, AgentPersona, LoopState } from './types.js';
 
 const MAX_ITERATIONS_PER_SUBTASK = 50;
+const MAX_ITERATIONS_TOOL_MODE = 15;
 const MAX_SUBTASK_RETRIES = 3;
 const CONCURRENT_WORKERS = 3;
 
+export async function processTask(task: Task): Promise<void> {
+  try {
+    let currentTask = getTask(task.id) || task;
+    
+    // 1. Routing Phase
+    if (!currentTask.mode) {
+      console.log(`[Router] Classifying intent for: ${currentTask.goal}`);
+      const mode = await routeTask(currentTask);
+      updateTask(currentTask.id, { mode });
+      currentTask = getTask(currentTask.id)!;
+    }
+
+    console.log(`[Execution] Mode: ${currentTask.mode} | Goal: ${currentTask.goal}`);
+
+    // 2. Dispatch
+    switch (currentTask.mode) {
+      case 'chat':
+        await runChatMode(currentTask);
+        break;
+      case 'tool':
+        await runToolMode(currentTask);
+        break;
+      case 'autonomous_dag':
+        await runOrchestrator(currentTask);
+        break;
+      default:
+        console.error(`[Execution] Unknown mode: ${currentTask.mode}`);
+        updateTask(currentTask.id, { status: 'failed', error: `Unknown execution mode: ${currentTask.mode}` });
+    }
+  } catch (err: any) {
+    console.error('[Execution] Fatal error:', err);
+    updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: err.message || 'Fatal execution error' });
+  }
+}
+
 export async function runAutonomousLoop(task: Task): Promise<void> {
-  await runOrchestrator(task);
+  await processTask(task);
+}
+
+async function routeTask(task: Task): Promise<Task['mode']> {
+  const systemPrompt = getSystemPrompt('router', { task });
+  const response = await callLLM(systemPrompt, `Classify this request: ${task.goal}`);
+  
+  try {
+    const classification = JSON.parse(cleanJsonResponse(response));
+    console.log(`[Router] Decision: ${classification.mode} (${classification.reasoning})`);
+    saveMemory(task.id, 'thought', `Routing to ${classification.mode} mode. Reasoning: ${classification.reasoning}`, null, 'episodic');
+    return classification.mode;
+  } catch (err) {
+    console.error('[Router] Failed to parse classification, defaulting to tool:', err);
+    return 'tool';
+  }
+}
+
+async function runChatMode(task: Task) {
+  updateTask(task.id, { status: 'running', startedAt: Date.now() });
+  const systemPrompt = getSystemPrompt('chat', { task });
+  const response = await callLLM(systemPrompt, task.goal, 'text/plain');
+  
+  saveMemory(task.id, 'output', response, null, 'working');
+  updateTask(task.id, { status: 'done', completedAt: Date.now(), result: response });
+  console.log(`[Chat] Response delivered.`);
+}
+
+async function runToolMode(task: Task) {
+  updateTask(task.id, { status: 'running', startedAt: Date.now() });
+  await ensureWorkspaceReady();
+  
+  const systemPrompt = getSystemPrompt('standalone_worker', { task });
+  const conversationHistory: Message[] = [
+    { role: 'user', content: task.goal }
+  ];
+
+  // Initialize with task createdAt - 1 to catch very early inputs
+  let lastProcessedInputTime = task.createdAt - 1;
+
+  for (let i = 1; i <= MAX_ITERATIONS_TOOL_MODE; i++) {
+    // Check for user input
+    const newInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+    for (const input of newInputs) {
+      conversationHistory.push({ role: 'user', content: `USER INPUT: ${input.content}` });
+      lastProcessedInputTime = Math.max(lastProcessedInputTime, input.createdAt);
+    }
+
+    const compressedHistory = conversationHistory.map(m => ({ ...m, content: compressContext(m.content) }));
+    const raw = await callLLM(systemPrompt, compressedHistory);
+    
+    // ALWAYS push assistant response to history to prevent spinning
+    conversationHistory.push({ role: 'assistant', content: raw });
+
+    let decision: any;
+    try {
+      decision = JSON.parse(cleanJsonResponse(raw));
+      console.log(`[Tool] Step ${i}:`, decision.thought);
+    } catch {
+      conversationHistory.push({ role: 'user', content: 'Invalid JSON. Use format: {"thought": "...", "command": "...", "done": false}' });
+      continue;
+    }
+
+    saveMemory(task.id, 'thought', decision.thought, null, 'working');
+
+    if (decision.done) {
+      updateTask(task.id, { status: 'done', completedAt: Date.now(), result: 'Task completed via Tool mode.' });
+      return;
+    }
+
+    const command = decision.command?.trim();
+    if (command === 'ask_user') {
+      let waiting = true;
+      while (waiting) {
+        await new Promise(r => setTimeout(r, 5000));
+        const checkInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+        if (checkInputs.length > 0) {
+          waiting = false;
+          i--;
+          break;
+        }
+      }
+      continue;
+    }
+
+    if (command) {
+      // Security Audit
+      const isSafe = await runSecurityAudit(task, command, { title: 'Tool Execution' } as any);
+      if (!isSafe) {
+        saveMemory(task.id, 'security_alert', `Blocked command: ${command}`, null, 'working');
+        conversationHistory.push({ role: 'user', content: 'Security Audit FAILED. Try another way.' });
+        continue;
+      }
+
+      saveMemory(task.id, 'command', `$ ${command}`, null, 'working');
+      const result = await execInContainer(command);
+      const output = (result.stdout + result.stderr) || '(no output)';
+      saveMemory(task.id, 'output', output, null, 'working');
+
+      conversationHistory.push({ role: 'user', content: `Output:\n${output}` });
+    } else {
+      // No command and not done? Ask for next step
+      conversationHistory.push({ role: 'user', content: 'Please provide a command or set "done" to true if you are finished.' });
+    }
+  }
+
+  updateTask(task.id, { status: 'failed', error: 'Max iterations reached in Tool mode' });
 }
 
 export async function runOrchestrator(task: Task): Promise<void> {
@@ -178,7 +326,8 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
     { role: 'user', content: `Start working on SubTask: ${subTask.title}\nDescription: ${subTask.description}` }
   ];
 
-  let lastProcessedInputTime = Date.now();
+  // Initialize with subTask createdAt - 1 to catch very early inputs
+  let lastProcessedInputTime = subTask.createdAt - 1;
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
     // Check for user input
@@ -201,13 +350,15 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
       continue;
     }
 
+    // ALWAYS push assistant response to history to prevent spinning
+    conversationHistory.push({ role: 'assistant', content: raw });
+
     let decision: any;
     try {
       decision = JSON.parse(cleanJsonResponse(raw));
       console.log(`[Worker] Decision for ${subTask.title}:`, JSON.stringify(decision, null, 2));
     } catch (err) {
       console.error(`[Worker] Failed to parse decision for ${subTask.title}. Raw:`, raw);
-      conversationHistory.push({ role: 'assistant', content: raw });
       conversationHistory.push({ role: 'user', content: 'Invalid JSON. Use format: {"thought": "...", "command": "...", "done": false}' });
       continue;
     }
@@ -248,22 +399,116 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
     }
 
     if (command) {
-      // Security Check
-      const isSafe = await runSecurityAudit(task, command, subTask);
-      if (!isSafe) {
-        saveMemory(task.id, 'security_alert', `Blocked potentially dangerous command: ${command}`, subTask.id, 'working');
-        conversationHistory.push({ role: 'assistant', content: raw });
-        conversationHistory.push({ role: 'user', content: 'Security Audit FAILED: The proposed command was blocked for safety reasons. Please suggest an alternative approach.' });
+      // ── Special structured commands (bypass shell security audit) ──────────
+
+      // str_replace: surgically edit a specific block in an existing file
+      if (decision.str_replace) {
+        const { file, old_str, new_str } = decision.str_replace;
+        saveMemory(
+          task.id,
+          "command",
+          `[str_replace] ${file}`,
+          subTask.id,
+          "working",
+        );
+        const result = await strReplaceInContainer(file, old_str, new_str);
+        const output = result.stdout + result.stderr || "(no output)";
+        saveMemory(
+          task.id,
+          "output",
+          `Exit ${result.exitCode}\n${output}`,
+          subTask.id,
+          "working",
+        );
+        conversationHistory.push({
+          role: "user",
+          content: `str_replace result (exit ${result.exitCode}):\n${output}`,
+        });
         continue;
       }
 
-      saveMemory(task.id, 'command', `$ ${command}`, subTask.id, 'working');
-      const result = await execInContainer(command, 600000); // 10 minute timeout
-      const output = (result.stdout + result.stderr) || '(no output)';
-      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      // read_file: read a file before editing, to confirm old_str exists
+      if (decision.read_file) {
+        const result = await readFileFromContainer(decision.read_file);
+        const output = result.stdout || "(empty file)";
+        saveMemory(
+          task.id,
+          "command",
+          `[read_file] ${decision.read_file}`,
+          subTask.id,
+          "working",
+        );
+        saveMemory(task.id, "output", output, subTask.id, "working");
+        conversationHistory.push({
+          role: "user",
+          content: `File contents of ${decision.read_file}:\n${output}`,
+        });
+        continue;
+      }
 
-      conversationHistory.push({ role: 'assistant', content: raw });
-      conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
+      // insert_at_line: insert code at a specific line number
+      if (decision.insert_at_line) {
+        const { file, line, text } = decision.insert_at_line;
+        saveMemory(
+          task.id,
+          "command",
+          `[insert_at_line] ${file}:${line}`,
+          subTask.id,
+          "working",
+        );
+        const result = await insertAtLineInContainer(file, line, text);
+        const output = result.stdout + result.stderr || "(no output)";
+        saveMemory(
+          task.id,
+          "output",
+          `Exit ${result.exitCode}\n${output}`,
+          subTask.id,
+          "working",
+        );
+        conversationHistory.push({
+          role: "user",
+          content: `insert_at_line result (exit ${result.exitCode}):\n${output}`,
+        });
+        continue;
+      }
+
+      // ── Regular shell command ───────────────────────────────────────────────
+      // Security Check
+      const isSafe = await runSecurityAudit(task, command, subTask);
+      if (!isSafe) {
+        saveMemory(
+          task.id,
+          "security_alert",
+          `Blocked potentially dangerous command: ${command}`,
+          subTask.id,
+          "working",
+        );
+        conversationHistory.push({
+          role: "user",
+          content:
+            "Security Audit FAILED: The proposed command was blocked for safety reasons. Please suggest an alternative approach.",
+        });
+        continue;
+      }
+
+      saveMemory(task.id, "command", `$ ${command}`, subTask.id, "working");
+      const result = await execInContainer(command, 600000); // 10 minute timeout
+      const output = result.stdout + result.stderr || "(no output)";
+      saveMemory(
+        task.id,
+        "output",
+        `Exit ${result.exitCode}\n${output}`,
+        subTask.id,
+        "working",
+      );
+
+      conversationHistory.push({
+        role: "user",
+        content: `Command output (exit ${result.exitCode}):\n${output}`,
+      });
+    } else {
+      // No command and not done? Ask for next step
+      conversationHistory.push({ role: 'user', content: 'Please provide a command or set "done" to true if you are finished.' });
     }
   }
 

@@ -50,7 +50,25 @@ app.get('/tasks/:id/memory', (req, res) => {
   res.json(getMemoryForTask(req.params.id));
 });
 
-import { getSubTasksForTask, getArtifactsForTask } from './memory.js';
+app.post('/tasks/:id/cancel', (req, res) => {
+  const { id } = req.params;
+  const task = getTask(id);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  
+  updateTask(id, { status: 'failed', error: 'Cancelled by user' });
+  
+  // Also fail all subtasks
+  const subtasks = getSubTasksForTask(id);
+  for (const st of subtasks) {
+    if (st.status === 'pending' || st.status === 'running') {
+      updateSubTask(st.id, { status: 'failed', error: 'Parent task cancelled' });
+    }
+  }
+  
+  res.json({ success: true, message: 'Task cancelled' });
+});
+
+import { getSubTasksForTask, getArtifactsForTask, updateTask, updateSubTask } from './memory.js';
 
 app.get('/tasks/:id/subtasks', (req, res) => {
   res.json(getSubTasksForTask(req.params.id));

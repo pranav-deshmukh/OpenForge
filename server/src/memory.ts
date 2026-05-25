@@ -24,6 +24,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     goal TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
+    mode TEXT,
     createdAt INTEGER NOT NULL,
     startedAt INTEGER,
     completedAt INTEGER,
@@ -102,6 +103,9 @@ try {
   db.exec(`ALTER TABLE tasks ADD COLUMN successCriteria TEXT`);
 } catch {}
 try {
+  db.exec(`ALTER TABLE tasks ADD COLUMN mode TEXT`);
+} catch {}
+try {
   db.exec(`ALTER TABLE subtasks ADD COLUMN critique TEXT`);
 } catch {}
 try {
@@ -150,8 +154,8 @@ function fromDbTask(row: any): Task {
 
 function toDbTask(task: Task): any {
   return {
+    mode: null,
     globalContext: null,
-    successCriteria: null,
     startedAt: null,
     completedAt: null,
     result: null,
@@ -172,8 +176,8 @@ export function createTask(goal: string): Task {
   };
   const dbTask = toDbTask(task);
   db.prepare(`
-    INSERT INTO tasks (id, goal, status, createdAt, iterations, globalContext, successCriteria)
-    VALUES (@id, @goal, @status, @createdAt, @iterations, @globalContext, @successCriteria)
+    INSERT INTO tasks (id, goal, status, mode, createdAt, iterations, globalContext, successCriteria)
+    VALUES (@id, @goal, @status, @mode, @createdAt, @iterations, @globalContext, @successCriteria)
   `).run(dbTask);
   return task;
 }
@@ -317,7 +321,7 @@ export function saveMemory(
     type,
     layer,
     content: typeof content === 'string' ? content : JSON.stringify(content),
-    metadata: metadata ? (typeof metadata === 'string' ? metadata : JSON.stringify(metadata)) : null,
+    metadata: metadata ? (typeof metadata === 'string' ? metadata : JSON.stringify(metadata)) : undefined,
     createdAt: Date.now(),
   };
   db.prepare(`
@@ -342,7 +346,11 @@ export function getMemoryForTask(taskId: string): MemoryEntry[] {
 }
 
 export function getMemoryForSubTask(subTaskId: string): MemoryEntry[] {
-  return db.prepare('SELECT * FROM memory WHERE subTaskId = ? ORDER BY createdAt ASC').all(subTaskId) as MemoryEntry[];
+  const subTask = getSubTask(subTaskId);
+  if (!subTask) return [];
+  // Include memory for THIS subtask AND global task memory (subTaskId IS NULL)
+  return db.prepare('SELECT * FROM memory WHERE subTaskId = ? OR (taskId = ? AND subTaskId IS NULL) ORDER BY createdAt ASC')
+    .all(subTaskId, subTask.taskId) as MemoryEntry[];
 }
 
 export function getAllMemory(): MemoryEntry[] {

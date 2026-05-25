@@ -187,3 +187,92 @@ export async function copyFromContainer(
 ): Promise<void> {
   await execDockerCommand(['cp', `${CONTAINER_NAME}:${containerPath}`, localPath]);
 }
+
+/**
+ * Surgically replace a unique string in a file inside the container.
+ * oldStr must appear EXACTLY ONCE in the file.
+ * Uses Python to avoid shell escaping hell with sed.
+ */
+export async function strReplaceInContainer(
+  filePath: string,
+  oldStr: string,
+  newStr: string,
+): Promise<ShellResult> {
+  // Write a tiny Python script to a temp file in the container to avoid
+  // any quoting/escaping issues with heredoc or echo
+  const script = [
+    "import sys",
+    `path = ${JSON.stringify(filePath)}`,
+    `old = ${JSON.stringify(oldStr)}`,
+    `new = ${JSON.stringify(newStr)}`,
+    'with open(path, "r", encoding="utf-8") as f:',
+    "    content = f.read()",
+    "count = content.count(old)",
+    "if count == 0:",
+    '    print("STR_REPLACE_ERROR: old_str not found in file", file=sys.stderr)',
+    "    sys.exit(1)",
+    "if count > 1:",
+    '    print(f"STR_REPLACE_ERROR: old_str found {count} times — must be unique", file=sys.stderr)',
+    "    sys.exit(1)",
+    "new_content = content.replace(old, new, 1)",
+    'with open(path, "w", encoding="utf-8") as f:',
+    "    f.write(new_content)",
+    'print(f"STR_REPLACE_OK: replaced 1 occurrence in {path}")',
+  ].join("\n");
+
+  // Write the script into the container as a temp file, then execute it
+  const tmpPath = `/tmp/_str_replace_${Date.now()}.py`;
+  const writeResult = await execInContainer(
+    `cat > ${tmpPath} << 'PYEOF'\n${script}\nPYEOF`,
+  );
+  if (writeResult.exitCode !== 0) {
+    return writeResult;
+  }
+  const result = await execInContainer(
+    `python3 ${tmpPath} && rm -f ${tmpPath}`,
+  );
+  return result;
+}
+
+/**
+ * Read a file from the container and return its contents as a string.
+ * Use this before str_replace to verify the old_str exists.
+ */
+export async function readFileFromContainer(
+  filePath: string,
+): Promise<ShellResult> {
+  return execInContainer(`cat ${filePath}`);
+}
+
+/**
+ * Insert text at a specific line number in a file inside the container.
+ * lineNumber is 1-based. Inserts BEFORE the given line.
+ */
+export async function insertAtLineInContainer(
+  filePath: string,
+  lineNumber: number,
+  textToInsert: string,
+): Promise<ShellResult> {
+  const script = [
+    "import sys",
+    `path = ${JSON.stringify(filePath)}`,
+    `line_no = ${lineNumber}`,
+    `insert_text = ${JSON.stringify(textToInsert)}`,
+    'with open(path, "r", encoding="utf-8") as f:',
+    "    lines = f.readlines()",
+    "if line_no < 1 or line_no > len(lines) + 1:",
+    '    print(f"INSERT_ERROR: line {line_no} out of range (file has {len(lines)} lines)", file=sys.stderr)',
+    "    sys.exit(1)",
+    "# Ensure insert text ends with newline",
+    'if not insert_text.endswith("\\n"):',
+    '    insert_text += "\\n"',
+    "lines.insert(line_no - 1, insert_text)",
+    'with open(path, "w", encoding="utf-8") as f:',
+    "    f.writelines(lines)",
+    'print(f"INSERT_OK: inserted at line {line_no} in {path}")',
+  ].join("\n");
+
+  const tmpPath = `/tmp/_insert_line_${Date.now()}.py`;
+  await execInContainer(`cat > ${tmpPath} << 'PYEOF'\n${script}\nPYEOF`);
+  return execInContainer(`python3 ${tmpPath} && rm -f ${tmpPath}`);
+}

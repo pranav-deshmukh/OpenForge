@@ -3,7 +3,8 @@ import type { Message } from './types.js';
 
 async function generateWithGemini(
   systemPrompt: string,
-  messages: Message[]
+  messages: Message[],
+  responseMimeType: 'application/json' | 'text/plain' = 'application/json'
 ): Promise<string> {
   const provider = process.env.AI_PROVIDER || 'vertex'; // 'vertex' or 'google'
   const model = process.env.GEMINI_MODEL ?? process.env.VERTEXAI_MODEL ?? 'gemini-1.5-pro';
@@ -42,7 +43,7 @@ async function generateWithGemini(
     config: {
       systemInstruction: systemPrompt,
       temperature: 0.2,
-      responseMimeType: "application/json",
+      responseMimeType,
     },
   });
 
@@ -65,20 +66,21 @@ async function generateWithGemini(
 export async function callLLM(
   systemPrompt: string,
   messages: Message[] | string,
+  responseMimeType: 'application/json' | 'text/plain' = 'application/json'
 ): Promise<string> {
   const msgArray: Message[] = typeof messages === 'string'
     ? [{ role: 'user', content: messages }]
     : messages;
 
   try {
-    return await generateWithGemini(systemPrompt, msgArray);
+    return await generateWithGemini(systemPrompt, msgArray, responseMimeType);
   } catch (err: any) {
     console.error(`[LLM] Error calling Gemini:`, err.message || err);
     const status = err?.status ?? err?.code;
     if (status === 429) {
       console.log('[LLM] API rate limited, waiting 15s...');
       await new Promise((r) => setTimeout(r, 15000));
-      return callLLM(systemPrompt, messages);
+      return callLLM(systemPrompt, messages, responseMimeType);
     }
     throw err;
   }
