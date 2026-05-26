@@ -4,6 +4,7 @@ export interface Task {
   id: string;
   goal: string;
   status: TaskStatus;
+  mode?: "chat" | "tool" | "autonomous_dag";
   createdAt: number;
   startedAt?: number;
   completedAt?: number;
@@ -99,5 +100,39 @@ export interface MemoryEntry {
 
 export interface MemoryWithTask extends MemoryEntry {
   taskGoal: string;
+}
+
+export interface QueueSnapshot {
+  concurrency: number;
+  runningTaskIds: string[];
+  runningCount: number;
+  pendingCount: number;
+  pending: Array<{
+    id: string;
+    goal: string;
+    createdAt: number;
+    mode: string | null;
+  }>;
+}
+
+export interface WorkspaceStatus {
+  containerName: string;
+  imageName: string;
+  status: "running" | "stopped" | "missing";
+}
+
+export interface SystemStatus {
+  ready: boolean;
+  queue: QueueSnapshot;
+  workspace: WorkspaceStatus;
+  tasks: {
+    total: number;
+    pending: number;
+    running: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+  };
+  timestamp: number;
 }
 

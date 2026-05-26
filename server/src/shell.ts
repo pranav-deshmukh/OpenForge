@@ -12,6 +12,10 @@ export interface ShellResult {
 
 import { getIo } from './memory.js';
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
 export async function execInContainer(
   command: string,
   timeoutMs = 60000
@@ -95,6 +99,8 @@ export async function ensureWorkspaceReady(): Promise<void> {
 
   const dockerfile = `FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
+ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
+ENV PATH=$PATH:/usr/local/share/npm-global/bin
 
 # System packages
 RUN apt-get update && apt-get install -y \\
@@ -170,10 +176,8 @@ async function startContainer(): Promise<void> {
     '--cpus=1',
     '-v', `${skillsPath}:/skills`,
     '-v', `${workspacePath}:/workspace`,
-    '-v', `openforge-npm-global:/usr/local/lib/node_modules`,
-    '-v', `openforge-npm-bin:/usr/local/bin`,
+    '-v', `openforge-npm-global:/usr/local/share/npm-global`,
     '-v', `openforge-pip-packages:/usr/local/lib/python3`,
-    '-v', `openforge-pip-bin:/usr/local/bin/python-scripts`,
     '-v', `openforge-root-cache:/root/.cache`,
     '-v', `openforge-root-local:/root/.local`,
     '-p', '4000-4010:4000-4010',
@@ -183,6 +187,25 @@ async function startContainer(): Promise<void> {
   ]);
 
   console.log(`[Shell] Workspace container started`);
+}
+
+export async function getWorkspaceStatus(): Promise<{
+  containerName: string;
+  imageName: string;
+  status: 'running' | 'stopped' | 'missing';
+}> {
+  try {
+    const result = await execDockerCommand([
+      'inspect', '-f', '{{.State.Status}}', CONTAINER_NAME,
+    ]);
+    const status = result.stdout.trim();
+    if (status === 'running') {
+      return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'running' };
+    }
+    return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'stopped' };
+  } catch {
+    return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'missing' };
+  }
 }
 
 // Helper for docker commands that don't need stdin
@@ -281,7 +304,12 @@ export async function strReplaceInContainer(
 export async function readFileFromContainer(
   filePath: string,
 ): Promise<ShellResult> {
-  return execInContainer(`cat ${filePath}`);
+  return execInContainer(`cat ${shellQuote(filePath)}`);
+}
+
+export async function pathExistsInContainer(filePath: string): Promise<boolean> {
+  const result = await execInContainer(`test -e ${shellQuote(filePath)}`);
+  return result.exitCode === 0;
 }
 
 /**

@@ -7,53 +7,52 @@ description: Use when you need to create, read, edit, organize files and directo
 
 ## Creating new files
 
-\`\`\`bash
+```bash
 mkdir -p /workspace/my-project
 cat > /workspace/file.ts << 'EOF'
 // file contents here
 EOF
-\`\`\`
+```
 
 ## Reading files (do this before editing)
 
-\`\`\`bash
+```bash
 cat /workspace/file.ts
 cat -n /workspace/file.ts # with line numbers
 wc -l /workspace/file.ts # count lines
 grep -n "function foo" /workspace/file.ts # find line numbers
-\`\`\`
+```
 
-## Editing existing files — use str_replace (preferred)
+## Editing existing files - use native edit tools
 
-Use the structured str_replace command in your JSON response instead of shell commands for edits.
-It is safer, token-efficient, and cannot accidentally corrupt the file.
+Use the native edit tools instead of shell overwrite commands for edits.
+They are safer, token-efficient, and preserve unchanged parts of the file.
 
-Example response to edit an existing file:
-\`\`\`json
-{
-"thought": "I need to fix the return type of the getUser function.",
-"str_replace": {
-"file": "/workspace/src/users.ts",
-"old_str": "export function getUser(id: string) {\n return db.find(id);\n}",
-"new_str": "export function getUser(id: string): User | null {\n return db.find(id) ?? null;\n}"
-},
-"command": "",
-"done": false
-}
-\`\`\`
+Preferred tools:
+
+- `read_file`: read the file before editing.
+- `str_replace_file`: replace one unique block in an existing file.
+- `insert_at_line`: insert focused text at a specific line.
+
+Rules:
+
+1. Read the file first.
+2. Use `str_replace_file` when changing an existing block.
+3. Use `insert_at_line` for targeted additions like imports.
+4. Do not overwrite an existing file from the shell.
 
 ## When to use shell commands for files
 
 Only use shell commands for file operations when:
 
-- Appending to a file: \`echo "new line" >> /workspace/file.txt\`
-- Deleting files: \`rm /workspace/unwanted.ts\`
-- Moving/copying: \`cp /workspace/a.ts /workspace/b.ts\`
-- Creating directories: \`mkdir -p /workspace/new-dir\`
-- Searching: \`grep -rn "pattern" /workspace/src/\`
-- Checking existence: \`ls -la /workspace/\`
+- Appending to a file: `echo "new line" >> /workspace/file.txt`
+- Deleting files: `rm /workspace/unwanted.ts`
+- Moving/copying: `cp /workspace/a.ts /workspace/b.ts`
+- Creating directories: `mkdir -p /workspace/new-dir`
+- Searching: `grep -rn "pattern" /workspace/src/`
+- Checking existence: `ls -la /workspace/`
 
 ## Never do this
 
-- \`cat > /workspace/existing-file.ts << 'EOF' ... EOF\` — this overwrites the whole file
-- Large \`sed -i\` replacements on existing files — use str_replace instead
+- `cat > /workspace/existing-file.ts << 'EOF' ... EOF` - this overwrites the whole file
+- Large `sed -i` replacements on existing files - use `str_replace_file` instead

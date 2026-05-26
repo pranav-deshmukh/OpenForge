@@ -1,6 +1,7 @@
-import { MemoryEntry, Task, SubTask, Artifact } from "./types";
+import { Artifact, MemoryEntry, SubTask, SystemStatus, Task } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
+export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
+export const SOCKET_BASE = process.env.NEXT_PUBLIC_SOCKET_BASE_URL ?? API_BASE;
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -70,16 +71,19 @@ export function createResearchTask(goal: string): Promise<Task> {
   });
 }
 
-export function createBuilderTask(goal: string): Promise<Task> {
-  return request<Task>("/build", {
-    method: "POST",
-    body: JSON.stringify({ goal }),
-  });
-}
-
 export function sendTaskInput(taskId: string, content: string): Promise<MemoryEntry> {
   return request<MemoryEntry>(`/tasks/${taskId}/input`, {
     method: "POST",
     body: JSON.stringify({ content }),
   });
+}
+
+export function cancelTask(taskId: string): Promise<{ success: boolean; message: string }> {
+  return request<{ success: boolean; message: string }>(`/tasks/${taskId}/cancel`, {
+    method: "POST",
+  });
+}
+
+export function getSystemStatus(): Promise<SystemStatus> {
+  return request<SystemStatus>("/system/status");
 }

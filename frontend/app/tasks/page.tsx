@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { AppShell } from "@/components/app-shell";
 import * as api from "@/lib/api";
 import { StatusBadge, SubTaskStatusBadge } from "@/components/badges";
@@ -77,9 +78,9 @@ export default function TasksPage() {
               </button>
             ))}
           </div>
-          <button className="px-4 py-1.5 bg-accent-purple text-white font-mono text-xs font-bold uppercase tracking-wider hidden md:block">
-            NEW GOAL
-          </button>
+          <Link href="/" className="hidden rounded bg-accent-purple px-4 py-1.5 text-xs font-bold uppercase tracking-wider text-white md:block">
+            New Task
+          </Link>
         </div>
 
         <div className="flex-1 w-full overflow-x-auto relative">
@@ -116,7 +117,7 @@ export default function TasksPage() {
                         <StatusBadge status={task.status} />
                       </div>
                       <div className="font-mono text-text-primary line-clamp-1">{task.goal}</div>
-                      <div className="font-mono text-text-secondary text-xs">{task.iterations || 0}/30</div>
+                      <div className="font-mono text-text-secondary text-xs">{task.iterations || 0} steps</div>
                       <div className="font-mono text-text-secondary text-xs">{createdAt.toLocaleTimeString()}</div>
                       <div className="font-mono text-text-secondary text-xs">{dur}</div>
                     </div>
@@ -223,7 +224,7 @@ export default function TasksPage() {
                           >
                             <input 
                               name="content"
-                              placeholder="Type 'approve' to start execution or provide feedback..."
+                              placeholder="Send guidance or feedback to this task..."
                               className="flex-1 bg-bg-surface border border-bg-border px-3 py-2 text-xs font-mono text-text-primary focus:outline-none focus:border-accent-purple"
                               autoFocus
                             />

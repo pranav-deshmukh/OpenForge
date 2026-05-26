@@ -6,6 +6,7 @@ import {
   strReplaceInContainer,
   readFileFromContainer,
   insertAtLineInContainer,
+  pathExistsInContainer,
   getPreinstalledPackages,
 } from "./shell.js";
 // Skills are loaded dynamically in future — not injected statically
@@ -13,19 +14,96 @@ import {
   saveMemory, updateTask, getTask, getMemoryForTask, 
   createSubTask, updateSubTask, getSubTasksForTask, getSubTask,
   createArtifact, getArtifactsForTask, createReflection,
-  getMemoryForSubTask, compressContext
+  getMemoryForSubTask, compressContext, incrementTaskIterations
 } from './memory.js';
 import { getSystemPrompt } from './prompts.js';
-import type { Message, Task, SubTask, Artifact, AgentPersona, LoopState } from './types.js';
+import type { Message, Task, SubTask } from './types.js';
 
 const MAX_ITERATIONS_PER_SUBTASK = 50;
 const MAX_ITERATIONS_TOOL_MODE = 15;
 const MAX_SUBTASK_RETRIES = 3;
 const CONCURRENT_WORKERS = 3;
 
+function isTaskCancelled(taskId: string): boolean {
+  return getTask(taskId)?.status === 'cancelled';
+}
+
+function isSubTaskCancelled(subTaskId: string): boolean {
+  const subTask = getSubTask(subTaskId);
+  if (!subTask) return true;
+  return subTask.status === 'cancelled' || isTaskCancelled(subTask.taskId);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForUserInput(
+  taskId: string,
+  subTaskId: string | null,
+  lastProcessedInputTime: number,
+): Promise<number> {
+  while (true) {
+    if (isTaskCancelled(taskId) || (subTaskId && isSubTaskCancelled(subTaskId))) {
+      throw new Error('Task cancelled by user');
+    }
+
+    await sleep(2000);
+    const entries = subTaskId
+      ? getMemoryForSubTask(subTaskId)
+      : getMemoryForTask(taskId);
+    const newInputs = entries.filter((m) => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+    if (newInputs.length > 0) {
+      return Math.max(...newInputs.map((m) => m.createdAt), lastProcessedInputTime);
+    }
+  }
+}
+
+function heuristicRouteTask(goal: string): Task['mode'] | null {
+  const text = goal.trim().toLowerCase();
+  if (!text) return 'chat';
+
+  const isQuestion =
+    text.endsWith('?') ||
+    /^(what|why|how|who|when|where|can you explain|explain)\b/.test(text);
+  if (isQuestion && !/(build|implement|create|edit|fix|run|install|write)\b/.test(text)) {
+    return 'chat';
+  }
+
+  if (
+    /(build|create|implement|research and implement|multi-step|full-stack|system|architecture|workflow|saas|agent)\b/.test(text) &&
+    /(app|project|system|workflow|service|dashboard|platform|research)\b/.test(text)
+  ) {
+    return 'autonomous_dag';
+  }
+
+  if (/(run|fix|edit|change|update|refactor|test|debug|create file|write file|rename)\b/.test(text)) {
+    return 'tool';
+  }
+
+  if (text.split(/\s+/).length > 40) {
+    return 'autonomous_dag';
+  }
+
+  return null;
+}
+
+function dependencyIdsFromTitles(
+  dependencyTitles: string[] = [],
+  titleToId: Map<string, string>,
+): string[] {
+  return dependencyTitles
+    .map((title) => titleToId.get(title))
+    .filter((value): value is string => Boolean(value));
+}
+
 export async function processTask(task: Task): Promise<void> {
   try {
     let currentTask = getTask(task.id) || task;
+    if (currentTask.status === 'cancelled') {
+      console.log(`[Execution] Skipping cancelled task ${currentTask.id}`);
+      return;
+    }
     
     // 1. Routing Phase
     if (!currentTask.mode) {
@@ -63,6 +141,12 @@ export async function runAutonomousLoop(task: Task): Promise<void> {
 }
 
 async function routeTask(task: Task): Promise<Task['mode']> {
+  const heuristic = heuristicRouteTask(task.goal);
+  if (heuristic) {
+    saveMemory(task.id, 'thought', `Routing to ${heuristic} mode using local heuristic.`, null, 'episodic');
+    return heuristic;
+  }
+
   const systemPrompt = getSystemPrompt('router', { task });
   const response = await callLLM(systemPrompt, `Classify this request: ${task.goal}`);
   
@@ -72,15 +156,89 @@ async function routeTask(task: Task): Promise<Task['mode']> {
     saveMemory(task.id, 'thought', `Routing to ${classification.mode} mode. Reasoning: ${classification.reasoning}`, null, 'episodic');
     return classification.mode;
   } catch (err) {
-    console.error('[Router] Failed to parse classification, defaulting to tool:', err);
-    return 'tool';
+    const fallback = heuristicRouteTask(task.goal) ?? 'tool';
+    console.error(`[Router] Failed to parse classification, defaulting to ${fallback}:`, err);
+    saveMemory(task.id, 'error', `Router parse failed. Falling back to ${fallback} mode.`, null, 'working');
+    return fallback;
   }
+}
+
+function unquoteShellPath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (
+    (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+    (trimmed.startsWith('"') && trimmed.endsWith('"'))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function extractOverwriteCandidates(command: string): string[] {
+  const candidates = new Set<string>();
+  const redirectionPattern = /(^|[\s;|&])>\s*("[^"]+"|'[^']+'|\/workspace\/[^\s;|&]+)/gm;
+  const teePattern = /\btee\s+("[^"]+"|'[^']+'|\/workspace\/[^\s;|&]+)/gm;
+
+  for (const match of command.matchAll(redirectionPattern)) {
+    const path = match[2];
+    if (path) {
+      candidates.add(unquoteShellPath(path));
+    }
+  }
+
+  for (const match of command.matchAll(teePattern)) {
+    const path = match[1];
+    if (path) {
+      candidates.add(unquoteShellPath(path));
+    }
+  }
+
+  return [...candidates];
+}
+
+async function findExistingFileOverwriteTarget(command: string): Promise<string | null> {
+  for (const candidate of extractOverwriteCandidates(command)) {
+    if (await pathExistsInContainer(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function blockExistingFileOverwrite(
+  taskId: string,
+  subTaskId: string | null,
+  command: string,
+  conversationHistory: Message[],
+): Promise<boolean> {
+  const existingTarget = await findExistingFileOverwriteTarget(command);
+  if (!existingTarget) {
+    return false;
+  }
+
+  saveMemory(
+    taskId,
+    'security_alert',
+    `Blocked shell overwrite of existing file: ${existingTarget} via ${command}`,
+    subTaskId,
+    'working',
+  );
+  conversationHistory.push({
+    role: 'user',
+    content:
+      `That shell command would overwrite the existing file ${existingTarget}. ` +
+      'Read the file first, then use str_replace_file or insert_at_line instead.',
+  });
+  return true;
 }
 
 async function runChatMode(task: Task) {
   updateTask(task.id, { status: 'running', startedAt: Date.now() });
   const systemPrompt = getSystemPrompt('chat', { task });
   const response = await callLLM(systemPrompt, task.goal, 'text/plain');
+  if (isTaskCancelled(task.id)) {
+    return;
+  }
   
   saveMemory(task.id, 'output', response, null, 'working');
   updateTask(task.id, { status: 'done', completedAt: Date.now(), result: response });
@@ -112,6 +270,11 @@ If you need a package NOT in the above list, install it normally. It will persis
   let lastProcessedInputTime = task.createdAt - 1;
 
   for (let i = 1; i <= MAX_ITERATIONS_TOOL_MODE; i++) {
+    if (isTaskCancelled(task.id)) {
+      return;
+    }
+    incrementTaskIterations(task.id);
+
     // Check for user input
     const newInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
     for (const input of newInputs) {
@@ -119,65 +282,112 @@ If you need a package NOT in the above list, install it normally. It will persis
       lastProcessedInputTime = Math.max(lastProcessedInputTime, input.createdAt);
     }
 
-    const compressedHistory = conversationHistory.map(m => ({ ...m, content: compressContext(m.content) }));
-    const raw = await callLLM(systemPrompt, compressedHistory);
-    
-    // ALWAYS push assistant response to history to prevent spinning
-    conversationHistory.push({ role: 'assistant', content: raw });
-
-    let decision: any;
+    let response;
     try {
-      decision = JSON.parse(cleanJsonResponse(raw));
-      console.log(`[Tool] Step ${i}:`, decision.thought);
-    } catch {
-      conversationHistory.push({ role: 'user', content: 'Invalid JSON. Use format: {"thought": "...", "command": "...", "done": false}' });
+      const compressedHistory = conversationHistory.map(m => ({
+        ...m,
+        content: compressContext(m.content)
+      }));
+      response = await callLLMWithTools(systemPrompt, compressedHistory, WORKER_TOOLS);
+    } catch (err: any) {
+      saveMemory(task.id, 'error', `LLM error in tool mode: ${err.message}`, null, 'working');
       continue;
     }
 
-    saveMemory(task.id, 'thought', decision.thought, null, 'working');
+    const { thought, toolCall } = response;
 
-    if (decision.done) {
-      updateTask(task.id, { status: 'done', completedAt: Date.now(), result: 'Task completed via Tool mode.' });
+    if (thought) {
+      saveMemory(task.id, 'thought', thought, null, 'working');
+      console.log(`[Tool] Step ${i} thought: ${thought.slice(0, 120)}...`);
+    }
+
+    // Push assistant turn into history
+    conversationHistory.push({ role: 'assistant', content: thought || `[tool: ${toolCall?.name}]` });
+
+    if (!toolCall) {
+      conversationHistory.push({ role: 'user', content: 'Please call one of your available tools to proceed. If the task is complete, call task_done.' });
+      continue;
+    }
+
+    console.log(`[Tool] Tool call: ${toolCall.name}`, JSON.stringify(toolCall.args).slice(0, 100));
+
+    // ── Dispatch tool calls ──────────────────────────────────────────────────
+
+    if (toolCall.name === 'task_done') {
+      const { summary } = toolCall.args;
+      if (!isTaskCancelled(task.id)) {
+        updateTask(task.id, { status: 'done', completedAt: Date.now(), result: summary || 'Task completed via Tool mode.' });
+      }
       return;
     }
 
-    const command = decision.command?.trim();
-    if (command === 'ask_user') {
-      let waiting = true;
-      while (waiting) {
-        await new Promise(r => setTimeout(r, 5000));
-        const checkInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
-        if (checkInputs.length > 0) {
-          waiting = false;
-          i--;
-          break;
-        }
-      }
+    if (toolCall.name === 'ask_user') {
+      saveMemory(task.id, 'thought', `WAITING FOR USER: ${toolCall.args.question}`, null, 'working');
+      lastProcessedInputTime = await waitForUserInput(task.id, null, lastProcessedInputTime);
+      i--;
       continue;
     }
 
-    if (command) {
+    if (toolCall.name === 'read_file') {
+      const { path } = toolCall.args;
+      saveMemory(task.id, 'command', `[read_file] ${path}`, null, 'working');
+      const result = await readFileFromContainer(path);
+      const output = result.stdout || '(empty file)';
+      saveMemory(task.id, 'output', output.slice(0, 2000), null, 'working');
+      conversationHistory.push({ role: 'user', content: `Contents of ${path}:\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'str_replace_file') {
+      const { file, old_str, new_str } = toolCall.args;
+      saveMemory(task.id, 'command', `[str_replace] ${file}`, null, 'working');
+      const result = await strReplaceInContainer(file, old_str, new_str);
+      const output = (result.stdout + result.stderr) || '(no output)';
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'insert_at_line') {
+      const { file, line, text } = toolCall.args;
+      saveMemory(task.id, 'command', `[insert_at_line] ${file}:${line}`, null, 'working');
+      const result = await insertAtLineInContainer(file, line, text);
+      const output = (result.stdout + result.stderr) || '(no output)';
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'run_shell') {
+      const { command } = toolCall.args;
+
+      if (await blockExistingFileOverwrite(task.id, null, command, conversationHistory)) {
+        continue;
+      }
+
       // Security Audit
       const isSafe = await runSecurityAudit(task, command, { title: 'Tool Execution' } as any);
       if (!isSafe) {
         saveMemory(task.id, 'security_alert', `Blocked command: ${command}`, null, 'working');
-        conversationHistory.push({ role: 'user', content: 'Security Audit FAILED. Try another way.' });
+        conversationHistory.push({ role: 'user', content: 'That command is blocked by the security policy. Please use a safer alternative.' });
         continue;
       }
 
       saveMemory(task.id, 'command', `$ ${command}`, null, 'working');
       const result = await execInContainer(command);
       const output = (result.stdout + result.stderr) || '(no output)';
-      saveMemory(task.id, 'output', output, null, 'working');
-
-      conversationHistory.push({ role: 'user', content: `Output:\n${output}` });
-    } else {
-      // No command and not done? Ask for next step
-      conversationHistory.push({ role: 'user', content: 'Please provide a command or set "done" to true if you are finished.' });
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
+      continue;
     }
+
+    // Unknown tool
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
   }
 
-  updateTask(task.id, { status: 'failed', error: 'Max iterations reached in Tool mode' });
+  if (!isTaskCancelled(task.id)) {
+    updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached in Tool mode' });
+  }
 }
 
 export async function runOrchestrator(task: Task): Promise<void> {
@@ -196,12 +406,16 @@ export async function runOrchestrator(task: Task): Promise<void> {
     const activeSubTasks = new Set<string>();
 
     while (!completed) {
+      if (isTaskCancelled(task.id)) {
+        return;
+      }
+      incrementTaskIterations(task.id);
       const subTasks = getSubTasksForTask(task.id);
       const unblocked = subTasks.filter(st => 
         st.status === 'pending' && 
         !activeSubTasks.has(st.id) &&
-        st.dependencies.every(depTitle => {
-          const dep = subTasks.find(s => s.title === depTitle);
+        st.dependencies.every(depId => {
+          const dep = subTasks.find(s => s.id === depId);
           return dep && dep.status === 'done';
         })
       );
@@ -234,12 +448,22 @@ export async function runOrchestrator(task: Task): Promise<void> {
       }
 
       // Wait a bit before checking status again
-      await new Promise(r => setTimeout(r, 5000));
+      await sleep(2000);
     }
 
     console.log(`\n[Orchestrator] Goal achieved: ${task.goal}`);
-    updateTask(task.id, { status: 'done', completedAt: Date.now(), result: 'Goal completed successfully via parallel DAG execution.' });
+    const completedSubTasks = getSubTasksForTask(task.id).filter((subTask) => subTask.status === 'done');
+    const artifactNames = getArtifactsForTask(task.id).map((artifact) => artifact.name);
+    const result = [
+      'Goal completed successfully.',
+      completedSubTasks.length > 0 ? `Completed subtasks: ${completedSubTasks.map((subTask) => subTask.title).join(', ')}` : '',
+      artifactNames.length > 0 ? `Artifacts: ${artifactNames.join(', ')}` : '',
+    ].filter(Boolean).join('\n');
+    updateTask(task.id, { status: 'done', completedAt: Date.now(), result });
   } catch (err: any) {
+    if (err.message === 'Task cancelled by user' || isTaskCancelled(task.id)) {
+      return;
+    }
     console.error('[Orchestrator] Fatal error:', err);
     updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: err.message || 'Fatal orchestrator error' });
     saveMemory(task.id, 'error', `Fatal orchestrator error: ${err.message || err}`, null, 'working');
@@ -247,11 +471,17 @@ export async function runOrchestrator(task: Task): Promise<void> {
 }
 
 async function dispatchWorker(task: Task, subTask: SubTask) {
+  if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    return;
+  }
   console.log(`\n[Orchestrator] Dispatching Worker for: ${subTask.title}`);
   await runWorkerAgent(task, subTask);
   
   // Verification Phase
   const updatedSubTask = getSubTask(subTask.id);
+  if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    return;
+  }
   if (updatedSubTask && updatedSubTask.status === 'done') {
     const passed = await verifySubTask(task, updatedSubTask);
     if (passed) {
@@ -283,41 +513,31 @@ async function planTask(task: Task) {
     });
 
     const subTaskSummary = plan.subTasks.map((st: any) => `- ${st.title}: ${st.description}`).join('\n');
-    saveMemory(task.id, 'thought', `I have generated an execution plan:\n${subTaskSummary}\n\nPlease review and reply 'approve' to proceed, or provide feedback to replan.`, null, 'episodic');
-    
-    // Pause for user approval
-    let approved = false;
-    let lastProcessedInputTime = Date.now();
-    
-    while (!approved) {
-      await new Promise(r => setTimeout(r, 5000));
-      const inputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
-      
-      if (inputs.length > 0) {
-        const lastInput = inputs[inputs.length - 1].content.toLowerCase();
-        if (lastInput.includes('approve')) {
-          approved = true;
-          saveMemory(task.id, 'thought', 'Plan approved. Starting execution...', null, 'episodic');
-        } else {
-          // Re-planning with feedback
-          saveMemory(task.id, 'thought', `Feedback received: "${lastInput}". Re-planning...`, null, 'episodic');
-          return planTask(task); // Recursive call for now, could be improved
-        }
-      }
-    }
+    saveMemory(task.id, 'thought', `Execution plan:\n${subTaskSummary}\n\nExecution starts automatically. You can send feedback while the task runs.`, null, 'episodic');
 
-    for (const st of plan.subTasks) {
+    const createdSubTasks: SubTask[] = plan.subTasks.map((st: any) =>
       createSubTask({
         taskId: task.id,
         title: st.title,
         description: st.description,
         type: st.type,
-        dependencies: st.dependencies || [],
+        dependencies: [],
         priority: st.priority || 0,
         inputArtifacts: st.inputArtifacts || [],
         outputArtifacts: st.outputArtifacts || [],
         successCriteria: st.successCriteria || [],
+      }),
+    );
+    const titleToId = new Map<string, string>(
+      createdSubTasks.map((createdSubTask: SubTask) => [createdSubTask.title, createdSubTask.id]),
+    );
+    plan.subTasks.forEach((st: any, index: number) => {
+      updateSubTask(createdSubTasks[index].id, {
+        dependencies: dependencyIdsFromTitles(st.dependencies || [], titleToId),
       });
+    });
+    if (!plan.subTasks?.length) {
+      throw new Error('Planner returned no subtasks.');
     }
     saveMemory(task.id, 'thought', `Planner generated ${plan.subTasks.length} subtasks.`, null, 'episodic');
   } catch (err) {
@@ -359,7 +579,7 @@ const WORKER_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'str_replace_file',
-    description: 'Surgically edit an existing file by replacing a unique block of text. Never rewrites the whole file. Use this for ALL edits to existing files. old_str must appear exactly once in the file — include enough surrounding lines to make it unique.',
+    description: 'Surgically edit an existing file by replacing a unique block of text. Never rewrites the whole file. Use this for ALL edits to existing files. old_str must appear exactly once in the file - include enough surrounding lines to make it unique.',
     parameters: {
       type: 'object',
       properties: {
@@ -377,6 +597,28 @@ const WORKER_TOOLS: ToolDefinition[] = [
         }
       },
       required: ['file', 'old_str', 'new_str']
+    }
+  },
+  {
+    name: 'insert_at_line',
+    description: 'Insert new text at a specific 1-based line number in an existing file. Use this for focused additions like imports or a new statement inside a file without rewriting the whole file.',
+    parameters: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          description: 'Absolute path to the file inside the container'
+        },
+        line: {
+          type: 'number',
+          description: '1-based line number to insert before'
+        },
+        text: {
+          type: 'string',
+          description: 'The text to insert'
+        }
+      },
+      required: ['file', 'line', 'text']
     }
   },
   {
@@ -447,6 +689,11 @@ If you need a package NOT in the above list, install it normally. It will persis
   let lastProcessedInputTime = subTask.createdAt - 1;
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
+    if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+      return;
+    }
+    incrementTaskIterations(task.id);
+
     // Check for user input
     const newInputs = getMemoryForSubTask(subTask.id).filter(
       m => m.type === 'input' && m.createdAt > lastProcessedInputTime
@@ -499,24 +746,18 @@ If you need a package NOT in the above list, install it normally. It will persis
           producerSubTaskId: subTask.id
         });
       }
-      updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: summary });
+      if (!isTaskCancelled(task.id) && !isSubTaskCancelled(subTask.id)) {
+        updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: summary });
+      }
       return;
     }
 
     if (toolCall.name === 'ask_user') {
       saveMemory(task.id, 'thought', `[${subTask.title}] WAITING FOR USER: ${toolCall.args.question}`, subTask.id, 'working');
-      let waiting = true;
-      while (waiting) {
-        await new Promise(r => setTimeout(r, 5000));
-        const checkInputs = getMemoryForSubTask(subTask.id).filter(
-          m => m.type === 'input' && m.createdAt > lastProcessedInputTime
-        );
-        if (checkInputs.length > 0) {
-          waiting = false;
-          i--;
-          break;
-        }
-      }
+      updateSubTask(subTask.id, { status: 'waiting_for_human' });
+      lastProcessedInputTime = await waitForUserInput(task.id, subTask.id, lastProcessedInputTime);
+      updateSubTask(subTask.id, { status: 'running' });
+      i--;
       continue;
     }
 
@@ -540,10 +781,24 @@ If you need a package NOT in the above list, install it normally. It will persis
       continue;
     }
 
+    if (toolCall.name === 'insert_at_line') {
+      const { file, line, text } = toolCall.args;
+      saveMemory(task.id, 'command', `[insert_at_line] ${file}:${line}`, subTask.id, 'working');
+      const result = await insertAtLineInContainer(file, line, text);
+      const output = (result.stdout + result.stderr) || '(no output)';
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
     if (toolCall.name === 'run_shell') {
       const { command } = toolCall.args;
 
-      // Static blocklist — runs before LLM security audit
+      if (await blockExistingFileOverwrite(task.id, subTask.id, command, conversationHistory)) {
+        continue;
+      }
+
+      // Static blocklist - runs before LLM security audit
       const ALWAYS_BLOCK = [
         /rm\s+-rf\s+\/(?!workspace)/,
         /chmod\s+777\s+\//,
@@ -576,14 +831,19 @@ If you need a package NOT in the above list, install it normally. It will persis
       continue;
     }
 
-    // Unknown tool — tell the model
-    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: run_shell, read_file, str_replace_file, ask_user, task_done.` });
+    // Unknown tool - tell the model
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
   }
 
-  updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached' });
+  if (!isTaskCancelled(task.id) && !isSubTaskCancelled(subTask.id)) {
+    updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached' });
+  }
 }
 
 async function runSecurityAudit(task: Task, command: string, subTask: SubTask): Promise<boolean> {
+  if (isTaskCancelled(task.id)) {
+    return false;
+  }
   const systemPrompt = getSystemPrompt('security', { task, subTask });
   const response = await callLLM(systemPrompt, `Proposed Command: ${command}`);
   
@@ -596,6 +856,9 @@ async function runSecurityAudit(task: Task, command: string, subTask: SubTask): 
 }
 
 async function verifySubTask(task: Task, subTask: SubTask): Promise<boolean> {
+  if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    return false;
+  }
   console.log(`[Verifier] Validating: ${subTask.title}`);
   updateSubTask(subTask.id, { status: 'verifying' });
   const systemPrompt = getSystemPrompt('verifier', { task, subTask });
@@ -610,7 +873,14 @@ async function verifySubTask(task: Task, subTask: SubTask): Promise<boolean> {
   }
 
   const passed = !!result.passed;
-  saveMemory(task.id, 'thought', `[Verifier] ${subTask.title}: ${passed ? 'PASSED' : 'FAILED'}\n${result.thought || ''}`, subTask.id, 'working');
+  saveMemory(
+    task.id,
+    'thought',
+    `[Verifier] ${subTask.title}: ${passed ? 'PASSED' : 'FAILED'}\n${result.thought || ''}`,
+    subTask.id,
+    'working',
+    result.metrics || undefined,
+  );
   
   if (!passed) {
     updateSubTask(subTask.id, { status: 'failed', error: result.feedback || 'Verification failed' });
@@ -619,6 +889,9 @@ async function verifySubTask(task: Task, subTask: SubTask): Promise<boolean> {
 }
 
 async function runCriticLoop(task: Task, subTask: SubTask): Promise<boolean> {
+  if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    return false;
+  }
   console.log(`[Critic] Reviewing: ${subTask.title}`);
   updateSubTask(subTask.id, { status: 'critiquing' });
   const systemPrompt = getSystemPrompt('critic', { task, subTask });
@@ -633,7 +906,14 @@ async function runCriticLoop(task: Task, subTask: SubTask): Promise<boolean> {
   }
 
   const passed = !!result.passed;
-  saveMemory(task.id, 'critique', `[Critic] Score: ${result.score}/10 - ${passed ? 'PASSED' : 'FAILED'}\n${result.feedback || ''}`, subTask.id, 'episodic');
+  saveMemory(
+    task.id,
+    'critique',
+    `[Critic] Score: ${result.score}/10 - ${passed ? 'PASSED' : 'FAILED'}\n${result.feedback || ''}`,
+    subTask.id,
+    'episodic',
+    result.metrics || undefined,
+  );
   
   if (!passed) {
     updateSubTask(subTask.id, { status: 'failed', critique: result.feedback || 'Critique failed' });
@@ -644,6 +924,9 @@ async function runCriticLoop(task: Task, subTask: SubTask): Promise<boolean> {
 }
 
 async function handleSubTaskFailure(task: Task, subTask: SubTask, phase: string) {
+  if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    return;
+  }
   console.log(`[Reflection] Analyzing ${phase} failure for: ${subTask.title}`);
   const systemPrompt = getSystemPrompt('reflection', { task, subTask });
   const response = await callLLM(systemPrompt, `Analyze why ${subTask.title} failed in ${phase} phase.`);
@@ -672,6 +955,9 @@ async function handleSubTaskFailure(task: Task, subTask: SubTask, phase: string)
 }
 
 async function reflectAndReplan(task: Task) {
+  if (isTaskCancelled(task.id)) {
+    return;
+  }
   console.log('[Orchestrator] Replanning...');
   const subTasks = getSubTasksForTask(task.id);
   const artifacts = getArtifactsForTask(task.id);
@@ -682,21 +968,27 @@ async function reflectAndReplan(task: Task) {
   
   try {
     const plan = JSON.parse(cleanJsonResponse(response));
-    for (const st of plan.subTasks) {
-      const existing = subTasks.find(s => s.title === st.title);
-      if (!existing) {
-        createSubTask({
+    const newSubTasks = plan.subTasks.filter((st: any) => !subTasks.find((existing) => existing.title === st.title));
+    const created: SubTask[] = newSubTasks.map((st: any) =>
+      createSubTask({
           taskId: task.id,
           title: st.title,
           description: st.description,
           type: st.type,
-          dependencies: st.dependencies || [],
+          dependencies: [],
           priority: st.priority || 0,
           inputArtifacts: st.inputArtifacts || [],
           outputArtifacts: st.outputArtifacts || [],
           successCriteria: st.successCriteria || [],
-        });
-      }
+        }),
+    );
+    const titleToId = new Map<string, string>(
+      [...subTasks, ...created].map((createdSubTask: SubTask) => [createdSubTask.title, createdSubTask.id]),
+    );
+    for (let index = 0; index < newSubTasks.length; index++) {
+      updateSubTask(created[index].id, {
+        dependencies: dependencyIdsFromTitles(newSubTasks[index].dependencies || [], titleToId),
+      });
     }
   } catch (err) {
     console.error('[Orchestrator] Replanning failed to parse:', err);

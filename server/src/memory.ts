@@ -179,6 +179,9 @@ export function createTask(goal: string): Task {
     INSERT INTO tasks (id, goal, status, mode, createdAt, iterations, globalContext, successCriteria)
     VALUES (@id, @goal, @status, @mode, @createdAt, @iterations, @globalContext, @successCriteria)
   `).run(dbTask);
+  if (ioInstance) {
+    ioInstance.emit('task:update', task);
+  }
   return task;
 }
 
@@ -208,6 +211,47 @@ export function getAllTasks(): Task[] {
 
 export function getPendingTasks(): Task[] {
   return db.prepare("SELECT * FROM tasks WHERE status = 'pending' ORDER BY createdAt ASC").all().map(fromDbTask);
+}
+
+export function getTasksByStatuses(statuses: Task['status'][]): Task[] {
+  if (statuses.length === 0) return [];
+  const placeholders = statuses.map(() => '?').join(', ');
+  return db
+    .prepare(`SELECT * FROM tasks WHERE status IN (${placeholders}) ORDER BY createdAt ASC`)
+    .all(...statuses)
+    .map(fromDbTask);
+}
+
+export function incrementTaskIterations(id: string, delta = 1): Task | null {
+  const task = getTask(id);
+  if (!task) return null;
+  const nextIterations = (task.iterations ?? 0) + delta;
+  updateTask(id, { iterations: nextIterations });
+  return getTask(id);
+}
+
+export function recoverInterruptedTasks(): void {
+  const runningTasks = getTasksByStatuses(['running']);
+  for (const task of runningTasks) {
+    updateTask(task.id, {
+      status: 'pending',
+      error: 'Recovered after server restart before completion.',
+    });
+  }
+
+  const activeSubTasks = db
+    .prepare(
+      `SELECT id FROM subtasks WHERE status IN ('running', 'verifying', 'critiquing', 'retrying', 'waiting_for_human')`,
+    )
+    .all() as Array<{ id: string }>;
+
+  for (const { id } of activeSubTasks) {
+    updateSubTask(id, {
+      status: 'pending',
+      error: 'Recovered after server restart before completion.',
+      startedAt: undefined,
+    });
+  }
 }
 
 // SubTasks

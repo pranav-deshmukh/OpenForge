@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { FunctionCallingConfigMode, GoogleGenAI } from '@google/genai';
 import type { Message } from './types.js';
 
 async function generateWithGemini(
@@ -128,41 +128,53 @@ export async function callLLMWithTools(
     functionDeclarations: tools.map(t => ({
       name: t.name,
       description: t.description,
-      parameters: t.parameters,
+      parametersJsonSchema: t.parameters,
     }))
   }];
 
   console.log(`[LLM] Calling ${model} with ${tools.length} tools...`);
 
-  const result = await (ai.models as any).generateContent({
+  const result = await ai.models.generateContent({
     model,
     contents: messages.map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }],
     })),
-    tools: geminiTools,
     config: {
       systemInstruction: systemPrompt,
       temperature: 0.2,
+      tools: geminiTools,
+      toolConfig: {
+        functionCallingConfig: {
+          mode: FunctionCallingConfigMode.ANY,
+        },
+      },
     },
   });
 
-  // Extract thought text and function call from response
-  const candidates = result?.candidates ?? result?.response?.candidates ?? [];
-  const parts = candidates?.[0]?.content?.parts ?? [];
-
-  let thought = '';
+  let thought = result.text?.replace(/<think>[\s\S]*?<\/think>/g, '').trim() ?? '';
   let toolCall: ToolCall | null = null;
 
-  for (const part of parts) {
-    if (part.text) {
-      thought += part.text;
-    }
-    if (part.functionCall) {
-      toolCall = {
-        name: part.functionCall.name,
-        args: part.functionCall.args ?? {},
-      };
+  const directFunctionCall = result.functionCalls?.[0];
+  if (directFunctionCall?.name) {
+    toolCall = {
+      name: directFunctionCall.name,
+      args: directFunctionCall.args ?? {},
+    };
+  }
+
+  if (!toolCall) {
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    for (const part of parts) {
+      if (part.text) {
+        thought += part.text;
+      }
+      if (part.functionCall?.name) {
+        toolCall = {
+          name: part.functionCall.name,
+          args: part.functionCall.args ?? {},
+        };
+      }
     }
   }
 
@@ -181,6 +193,9 @@ export async function callLLMWithTools(
         thought = parsed.thought ?? thought;
       } else if (parsed.str_replace) {
         toolCall = { name: 'str_replace_file', args: parsed.str_replace };
+        thought = parsed.thought ?? thought;
+      } else if (parsed.insert_at_line) {
+        toolCall = { name: 'insert_at_line', args: parsed.insert_at_line };
         thought = parsed.thought ?? thought;
       } else if (parsed.read_file) {
         toolCall = { name: 'read_file', args: { path: parsed.read_file } };
