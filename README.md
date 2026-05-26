@@ -117,6 +117,18 @@ server/skills/your-skill/
 
 Document the skill's purpose, inputs, outputs, and examples in the SKILL.md file.
 
+### Resetting the workspace environment
+
+If you need to wipe your installed packages and start fresh (e.g. to clear a broken global install), you can run:
+
+```bash
+docker rm -f phd-agent-workspace
+docker rmi phd-agent-workspace:latest
+docker volume rm openforge-npm-global openforge-npm-bin openforge-pip-packages openforge-pip-bin openforge-root-cache openforge-root-local
+```
+
+This will force the server to rebuild the base image and recreate the named volumes on the next run.
+
 ## Technologies
 
 - **Frontend**: Next.js 16, React 19, Tailwind CSS

@@ -128,84 +128,15 @@ You MUST NOT drift into other tasks. Focus ONLY on this milestone.
 For editing existing files, use str_replace or insert_at_line.
 For new files, use a shell command like: cat > /workspace/file.ts << 'EOF' ... EOF
 
-## Response Format
+You have access to the following tools — use whichever fits the current need:
 
-For a regular shell command:
-\`\`\`json
-{
-  "thought": "What I am doing and why.",
-  "command": "shell command here",
-  "done": false
-}
-\`\`\`
+- run_shell: run bash commands. For new files, installing packages, running tests.
+- read_file: read a file's contents. Always do this before editing an existing file.
+- str_replace_file: surgically edit an existing file. Never rewrites the whole file. Use this for ALL edits to existing files.
+- ask_user: ask the user a question if genuinely blocked.
+- task_done: call when all success criteria are met.
 
-To READ a file before editing (always do this first):
-\`\`\`json
-{
-  "thought": "I need to read the file to find the exact text to replace.",
-  "read_file": "/workspace/path/to/file.ts",
-  "command": "",
-  "done": false
-}
-\`\`\`
-
-To SURGICALLY EDIT an existing file (preferred for all changes to existing files):
-\`\`\`json
-{
-  "thought": "I need to change only the function foo. I read the file and found the exact text.",
-  "str_replace": {
-    "file": "/workspace/path/to/file.ts",
-    "old_str": "the EXACT lines currently in the file that you want to replace — must be unique in the file",
-    "new_str": "the replacement lines"
-  },
-  "command": "",
-  "done": false
-}
-\`\`\`
-
-To INSERT new code at a specific line number (for adding imports, appending to a class, etc.):
-\`\`\`json
-{
-  "thought": "I need to insert a new import at line 3.",
-  "insert_at_line": {
-    "file": "/workspace/path/to/file.ts",
-    "line": 3,
-    "text": "import { something } from './somewhere';"
-  },
-  "command": "",
-  "done": false
-}
-\`\`\`
-
-To ask the user a question:
-\`\`\`json
-{
-  "thought": "I need clarification.",
-  "command": "ask_user",
-  "done": false
-}
-\`\`\`
-
-When finished:
-\`\`\`json
-{
-  "thought": "Final reflection on work completed.",
-  "command": "",
-  "done": true,
-  "summary": "Detailed summary of work done for the verifier.",
-  "artifacts": [{"name": "artifact_name", "type": "file|code|schema", "content": "..."}]
-}
-\`\`\`
-
-## str_replace Rules (important — read carefully)
-1. Always call read_file FIRST to get the exact current contents before making a str_replace.
-2. old_str must match the file EXACTLY — same whitespace, indentation, and line endings.
-3. old_str must be unique in the file. Include enough surrounding context (2–3 lines above and below) to make it unique.
-4. Make one str_replace call per logical change. Do not bundle 5 unrelated edits into one giant replacement.
-5. After each str_replace, verify with read_file or run the code to confirm it worked before the next edit.
-6. If you need to add a function to the end of a file, use: echo '...' >> /path/to/file or a heredoc via shell command — that is fine for appending.
-
-Use the tools provided to interact with the environment. Ground every action in empirical evidence.`;
+Ground every action in empirical evidence. Read before you edit. Verify after you edit.`;
 
     case 'verifier':
       if (!subTask) throw new Error('Verifier requires a subTask');

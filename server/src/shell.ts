@@ -95,15 +95,49 @@ export async function ensureWorkspaceReady(): Promise<void> {
 
   const dockerfile = `FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
+
+# System packages
 RUN apt-get update && apt-get install -y \\
     curl wget git vim nano \\
     python3 python3-pip python3-venv \\
     nodejs npm \\
     build-essential \\
     jq unzip zip \\
+    ripgrep fd-find \\
     && rm -rf /var/lib/apt/lists/*
-RUN pip3 install requests numpy pandas matplotlib scipy
-RUN npm install -g typescript ts-node
+
+# Upgrade npm itself
+RUN npm install -g npm@latest
+
+# Pre-bake common global Node packages — agent won't need to reinstall these
+RUN npm install -g \\
+    typescript \\
+    ts-node \\
+    nodemon \\
+    prettier \\
+    eslint \\
+    tsx \\
+    jest \\
+    http-server
+
+# Pre-bake common Python packages — agent won't need to reinstall these
+RUN pip3 install --no-cache-dir \\
+    requests \\
+    numpy \\
+    pandas \\
+    matplotlib \\
+    scipy \\
+    fastapi \\
+    uvicorn \\
+    pytest \\
+    black \\
+    httpx \\
+    python-dotenv
+
+# Mark what's pre-installed so the agent knows not to reinstall
+RUN echo "typescript ts-node nodemon prettier eslint tsx jest http-server" > /etc/openforge-preinstalled-npm && \\
+    echo "requests numpy pandas matplotlib scipy fastapi uvicorn pytest black httpx python-dotenv" > /etc/openforge-preinstalled-pip
+
 WORKDIR /workspace
 CMD ["tail", "-f", "/dev/null"]
 `;
@@ -136,6 +170,12 @@ async function startContainer(): Promise<void> {
     '--cpus=1',
     '-v', `${skillsPath}:/skills`,
     '-v', `${workspacePath}:/workspace`,
+    '-v', `openforge-npm-global:/usr/local/lib/node_modules`,
+    '-v', `openforge-npm-bin:/usr/local/bin`,
+    '-v', `openforge-pip-packages:/usr/local/lib/python3`,
+    '-v', `openforge-pip-bin:/usr/local/bin/python-scripts`,
+    '-v', `openforge-root-cache:/root/.cache`,
+    '-v', `openforge-root-local:/root/.local`,
     '-p', '4000-4010:4000-4010',
     '-e', `TAVILY_API_KEY=${process.env.TAVILY_API_KEY ?? ''}`,
     '-e', `OPENROUTER_API_KEY=${process.env.OPENROUTER_API_KEY ?? ''}`,
@@ -275,4 +315,17 @@ export async function insertAtLineInContainer(
   const tmpPath = `/tmp/_insert_line_${Date.now()}.py`;
   await execInContainer(`cat > ${tmpPath} << 'PYEOF'\n${script}\nPYEOF`);
   return execInContainer(`python3 ${tmpPath} && rm -f ${tmpPath}`);
+}
+
+/**
+ * Returns the list of pre-installed packages so the agent prompt
+ * can inform the agent what's already available without reinstalling.
+ */
+export async function getPreinstalledPackages(): Promise<{ npm: string[], pip: string[] }> {
+  const npmResult = await execInContainer('cat /etc/openforge-preinstalled-npm 2>/dev/null || echo ""');
+  const pipResult = await execInContainer('cat /etc/openforge-preinstalled-pip 2>/dev/null || echo ""');
+  return {
+    npm: npmResult.stdout.trim().split(' ').filter(Boolean),
+    pip: pipResult.stdout.trim().split(' ').filter(Boolean),
+  };
 }

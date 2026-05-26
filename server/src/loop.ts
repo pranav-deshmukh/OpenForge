@@ -1,12 +1,14 @@
-import { callLLM } from './agent.js';
+import { callLLM, callLLMWithTools } from './agent.js';
+import type { ToolDefinition } from './agent.js';
 import {
   ensureWorkspaceReady,
   execInContainer,
   strReplaceInContainer,
   readFileFromContainer,
   insertAtLineInContainer,
+  getPreinstalledPackages,
 } from "./shell.js";
-import { buildSkillCatalog, discoverSkills } from './skills.js';
+// Skills are loaded dynamically in future — not injected statically
 import { 
   saveMemory, updateTask, getTask, getMemoryForTask, 
   createSubTask, updateSubTask, getSubTasksForTask, getSubTask,
@@ -89,8 +91,20 @@ async function runToolMode(task: Task) {
   updateTask(task.id, { status: 'running', startedAt: Date.now() });
   await ensureWorkspaceReady();
   
+  const preinstalled = await getPreinstalledPackages();
+  const envContext = `
+
+## Environment — already installed, DO NOT reinstall these:
+
+Node (global): ${preinstalled.npm.join(', ')}
+Python (pip): ${preinstalled.pip.join(', ')}
+
+If you need a package NOT in the above list, install it normally. It will persist across sessions via Docker volumes.
+`;
+
   const systemPrompt = getSystemPrompt('standalone_worker', { task });
   const conversationHistory: Message[] = [
+    { role: 'user', content: envContext },
     { role: 'user', content: task.goal }
   ];
 
@@ -313,82 +327,190 @@ async function planTask(task: Task) {
   }
 }
 
+// ── Tool definitions — the agent sees these and picks automatically ──────────
+const WORKER_TOOLS: ToolDefinition[] = [
+  {
+    name: 'run_shell',
+    description: 'Run a bash command in the Docker workspace container. Use for: creating new files, installing packages, running tests, starting servers, listing directories, checking git status. Do NOT use for editing existing files — use str_replace_file instead.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The bash command to execute inside the container'
+        }
+      },
+      required: ['command']
+    }
+  },
+  {
+    name: 'read_file',
+    description: 'Read the full contents of a file inside the container. Always call this before editing an existing file so you have the exact current text.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute path to the file inside the container, e.g. /workspace/src/index.ts'
+        }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'str_replace_file',
+    description: 'Surgically edit an existing file by replacing a unique block of text. Never rewrites the whole file. Use this for ALL edits to existing files. old_str must appear exactly once in the file — include enough surrounding lines to make it unique.',
+    parameters: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          description: 'Absolute path to the file inside the container'
+        },
+        old_str: {
+          type: 'string',
+          description: 'The exact text currently in the file to be replaced. Must be unique — include 2-3 lines of context above and below the change if needed.'
+        },
+        new_str: {
+          type: 'string',
+          description: 'The text to replace old_str with'
+        }
+      },
+      required: ['file', 'old_str', 'new_str']
+    }
+  },
+  {
+    name: 'ask_user',
+    description: 'Pause execution and ask the user a clarifying question. Only use when genuinely blocked and cannot proceed without human input.',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'The question to ask the user'
+        }
+      },
+      required: ['question']
+    }
+  },
+  {
+    name: 'task_done',
+    description: 'Call this when the subtask is fully complete and all success criteria are met. Do not call this until the work is verified.',
+    parameters: {
+      type: 'object',
+      properties: {
+        summary: {
+          type: 'string',
+          description: 'Detailed summary of everything done, for the verifier agent'
+        },
+        artifacts: {
+          type: 'array',
+          description: 'List of produced artifacts',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              type: { type: 'string' },
+              content: { type: 'string' }
+            }
+          }
+        }
+      },
+      required: ['summary']
+    }
+  }
+];
+
 async function runWorkerAgent(task: Task, subTask: SubTask) {
   updateSubTask(subTask.id, { status: 'running', startedAt: Date.now() });
   saveMemory(task.id, 'thought', `Worker starting subtask: ${subTask.title}`, subTask.id, 'working');
 
-  const skills = discoverSkills('./skills');
-  const skillCatalog = buildSkillCatalog(skills);
+  const preinstalled = await getPreinstalledPackages();
+  const envContext = `
+
+## Environment — already installed, DO NOT reinstall these:
+
+Node (global): ${preinstalled.npm.join(', ')}
+Python (pip): ${preinstalled.pip.join(', ')}
+
+If you need a package NOT in the above list, install it normally. It will persist across sessions via Docker volumes.
+`;
+
   const artifacts = getArtifactsForTask(task.id);
   const systemPrompt = getSystemPrompt('worker', { task, subTask, artifacts });
 
   const conversationHistory: Message[] = [
+    { role: 'user', content: envContext },
     { role: 'user', content: `Start working on SubTask: ${subTask.title}\nDescription: ${subTask.description}` }
   ];
 
-  // Initialize with subTask createdAt - 1 to catch very early inputs
   let lastProcessedInputTime = subTask.createdAt - 1;
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
     // Check for user input
-    const newInputs = getMemoryForSubTask(subTask.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+    const newInputs = getMemoryForSubTask(subTask.id).filter(
+      m => m.type === 'input' && m.createdAt > lastProcessedInputTime
+    );
     for (const input of newInputs) {
       conversationHistory.push({ role: 'user', content: `USER INPUT: ${input.content}` });
       lastProcessedInputTime = Math.max(lastProcessedInputTime, input.createdAt);
     }
 
-    let raw: string;
+    let response;
     try {
-      // Compress history before calling LLM
       const compressedHistory = conversationHistory.map(m => ({
         ...m,
         content: compressContext(m.content)
       }));
-      raw = await callLLM(systemPrompt, compressedHistory);
+      response = await callLLMWithTools(systemPrompt, compressedHistory, WORKER_TOOLS);
     } catch (err: any) {
       saveMemory(task.id, 'error', `LLM error in worker: ${err.message}`, subTask.id, 'working');
       continue;
     }
 
-    // ALWAYS push assistant response to history to prevent spinning
-    conversationHistory.push({ role: 'assistant', content: raw });
+    const { thought, toolCall } = response;
 
-    let decision: any;
-    try {
-      decision = JSON.parse(cleanJsonResponse(raw));
-      console.log(`[Worker] Decision for ${subTask.title}:`, JSON.stringify(decision, null, 2));
-    } catch (err) {
-      console.error(`[Worker] Failed to parse decision for ${subTask.title}. Raw:`, raw);
-      conversationHistory.push({ role: 'user', content: 'Invalid JSON. Use format: {"thought": "...", "command": "...", "done": false}' });
+    if (thought) {
+      saveMemory(task.id, 'thought', `[${subTask.title}] ${thought}`, subTask.id, 'working');
+      console.log(`[Worker] ${subTask.title} thought: ${thought.slice(0, 120)}...`);
+    }
+
+    // Push assistant turn into history
+    conversationHistory.push({ role: 'assistant', content: thought || `[tool: ${toolCall?.name}]` });
+
+    if (!toolCall) {
+      // Model returned text only — nudge it to use a tool
+      conversationHistory.push({ role: 'user', content: 'Please call one of your available tools to proceed. If the task is complete, call task_done.' });
       continue;
     }
 
-    saveMemory(task.id, 'thought', `[${subTask.title}] ${decision.thought}`, subTask.id, 'working');
+    console.log(`[Worker] Tool call: ${toolCall.name}`, JSON.stringify(toolCall.args).slice(0, 100));
 
-    if (decision.done) {
-      // Worker claims they are done. Verifier will confirm.
-      if (decision.artifacts) {
-        for (const art of decision.artifacts) {
-          createArtifact({
-            taskId: task.id,
-            name: art.name,
-            type: art.type || 'unknown',
-            content: art.content || '',
-            producerSubTaskId: subTask.id
-          });
-        }
+    // ── Dispatch tool calls ──────────────────────────────────────────────────
+
+    if (toolCall.name === 'task_done') {
+      const { summary, artifacts: arts = [] } = toolCall.args;
+      for (const art of arts) {
+        createArtifact({
+          taskId: task.id,
+          name: art.name,
+          type: art.type || 'unknown',
+          content: art.content || '',
+          producerSubTaskId: subTask.id
+        });
       }
-      updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: decision.summary });
+      updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: summary });
       return;
     }
 
-    const command = decision.command?.trim();
-    if (command === 'ask_user') {
-      saveMemory(task.id, 'thought', `[${subTask.title}] WAITING FOR USER: ${decision.thought}`, subTask.id, 'working');
+    if (toolCall.name === 'ask_user') {
+      saveMemory(task.id, 'thought', `[${subTask.title}] WAITING FOR USER: ${toolCall.args.question}`, subTask.id, 'working');
       let waiting = true;
       while (waiting) {
         await new Promise(r => setTimeout(r, 5000));
-        const checkInputs = getMemoryForSubTask(subTask.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+        const checkInputs = getMemoryForSubTask(subTask.id).filter(
+          m => m.type === 'input' && m.createdAt > lastProcessedInputTime
+        );
         if (checkInputs.length > 0) {
           waiting = false;
           i--;
@@ -398,118 +520,64 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
       continue;
     }
 
-    if (command) {
-      // ── Special structured commands (bypass shell security audit) ──────────
+    if (toolCall.name === 'read_file') {
+      const { path } = toolCall.args;
+      saveMemory(task.id, 'command', `[read_file] ${path}`, subTask.id, 'working');
+      const result = await readFileFromContainer(path);
+      const output = result.stdout || '(empty file)';
+      saveMemory(task.id, 'output', output.slice(0, 2000), subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Contents of ${path}:\n${output}` });
+      continue;
+    }
 
-      // str_replace: surgically edit a specific block in an existing file
-      if (decision.str_replace) {
-        const { file, old_str, new_str } = decision.str_replace;
-        saveMemory(
-          task.id,
-          "command",
-          `[str_replace] ${file}`,
-          subTask.id,
-          "working",
-        );
-        const result = await strReplaceInContainer(file, old_str, new_str);
-        const output = result.stdout + result.stderr || "(no output)";
-        saveMemory(
-          task.id,
-          "output",
-          `Exit ${result.exitCode}\n${output}`,
-          subTask.id,
-          "working",
-        );
-        conversationHistory.push({
-          role: "user",
-          content: `str_replace result (exit ${result.exitCode}):\n${output}`,
-        });
+    if (toolCall.name === 'str_replace_file') {
+      const { file, old_str, new_str } = toolCall.args;
+      saveMemory(task.id, 'command', `[str_replace] ${file}`, subTask.id, 'working');
+      const result = await strReplaceInContainer(file, old_str, new_str);
+      const output = (result.stdout + result.stderr) || '(no output)';
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'run_shell') {
+      const { command } = toolCall.args;
+
+      // Static blocklist — runs before LLM security audit
+      const ALWAYS_BLOCK = [
+        /rm\s+-rf\s+\/(?!workspace)/,
+        /chmod\s+777\s+\//,
+        /curl[^|]+\|\s*(bash|sh)/,
+        /wget[^|]+\|\s*(bash|sh)/,
+        />\s*\/etc\//,
+        /mkfs/,
+        /dd\s+if=/,
+      ];
+      const hardBlocked = ALWAYS_BLOCK.some(pattern => pattern.test(command));
+      if (hardBlocked) {
+        saveMemory(task.id, 'security_alert', `Hard-blocked command: ${command}`, subTask.id, 'working');
+        conversationHistory.push({ role: 'user', content: 'That command is blocked by the security policy. Please use a safer alternative.' });
         continue;
       }
 
-      // read_file: read a file before editing, to confirm old_str exists
-      if (decision.read_file) {
-        const result = await readFileFromContainer(decision.read_file);
-        const output = result.stdout || "(empty file)";
-        saveMemory(
-          task.id,
-          "command",
-          `[read_file] ${decision.read_file}`,
-          subTask.id,
-          "working",
-        );
-        saveMemory(task.id, "output", output, subTask.id, "working");
-        conversationHistory.push({
-          role: "user",
-          content: `File contents of ${decision.read_file}:\n${output}`,
-        });
-        continue;
-      }
-
-      // insert_at_line: insert code at a specific line number
-      if (decision.insert_at_line) {
-        const { file, line, text } = decision.insert_at_line;
-        saveMemory(
-          task.id,
-          "command",
-          `[insert_at_line] ${file}:${line}`,
-          subTask.id,
-          "working",
-        );
-        const result = await insertAtLineInContainer(file, line, text);
-        const output = result.stdout + result.stderr || "(no output)";
-        saveMemory(
-          task.id,
-          "output",
-          `Exit ${result.exitCode}\n${output}`,
-          subTask.id,
-          "working",
-        );
-        conversationHistory.push({
-          role: "user",
-          content: `insert_at_line result (exit ${result.exitCode}):\n${output}`,
-        });
-        continue;
-      }
-
-      // ── Regular shell command ───────────────────────────────────────────────
-      // Security Check
+      // LLM security audit as second layer
       const isSafe = await runSecurityAudit(task, command, subTask);
       if (!isSafe) {
-        saveMemory(
-          task.id,
-          "security_alert",
-          `Blocked potentially dangerous command: ${command}`,
-          subTask.id,
-          "working",
-        );
-        conversationHistory.push({
-          role: "user",
-          content:
-            "Security Audit FAILED: The proposed command was blocked for safety reasons. Please suggest an alternative approach.",
-        });
+        saveMemory(task.id, 'security_alert', `Security audit blocked: ${command}`, subTask.id, 'working');
+        conversationHistory.push({ role: 'user', content: 'Security Audit FAILED: command blocked. Please suggest an alternative approach.' });
         continue;
       }
 
-      saveMemory(task.id, "command", `$ ${command}`, subTask.id, "working");
-      const result = await execInContainer(command, 600000); // 10 minute timeout
-      const output = result.stdout + result.stderr || "(no output)";
-      saveMemory(
-        task.id,
-        "output",
-        `Exit ${result.exitCode}\n${output}`,
-        subTask.id,
-        "working",
-      );
-
-      conversationHistory.push({
-        role: "user",
-        content: `Command output (exit ${result.exitCode}):\n${output}`,
-      });
-    } else {
-      // No command and not done? Ask for next step
-      conversationHistory.push({ role: 'user', content: 'Please provide a command or set "done" to true if you are finished.' });
+      saveMemory(task.id, 'command', `$ ${command}`, subTask.id, 'working');
+      const result = await execInContainer(command, 600000);
+      const output = (result.stdout + result.stderr) || '(no output)';
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
+      continue;
     }
+
+    // Unknown tool — tell the model
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: run_shell, read_file, str_replace_file, ask_user, task_done.` });
   }
 
   updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached' });
