@@ -8,6 +8,7 @@ import { Server } from 'socket.io';
 import {
   createTask,
   getAllMemory,
+  getAllSubTasks,
   getAllTasks,
   getArtifactsForTask,
   getMemoryForTask,
@@ -18,7 +19,9 @@ import {
   setIo,
   updateSubTask,
   updateTask,
+  getRecentMemoryEntries,
 } from './memory.js';
+import { getAgentActivitySnapshots, getAgentSnapshots } from './agents.js';
 import { getQueueSnapshot, nudgeQueue, startQueueWorker } from './queue.js';
 import { getWorkspaceStatus } from './shell.js';
 import { discoverSkills } from './skills.js';
@@ -93,6 +96,14 @@ app.get('/system/status', async (_req, res) => {
     },
     timestamp: Date.now(),
   });
+});
+
+app.get('/agents', (_req, res) => {
+  res.json(getAgentSnapshots(getAllSubTasks()));
+});
+
+app.get('/agents/activity', (_req, res) => {
+  res.json(getAgentActivitySnapshots(getAllSubTasks(), getRecentMemoryEntries()));
 });
 
 app.post('/tasks', (req, res) => {

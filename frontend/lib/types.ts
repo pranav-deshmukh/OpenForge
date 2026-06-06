@@ -1,5 +1,63 @@
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "cancelled";
 
+export type AgentId =
+  | "Forge"
+  | "Atlas"
+  | "Sage"
+  | "Cipher"
+  | "Loom"
+  | "Crucible"
+  | "Sentry"
+  | "Echo";
+
+export type AgentRuntimePhase =
+  | "idle"
+  | "routing"
+  | "planning"
+  | "delegating"
+  | "working"
+  | "verifying"
+  | "critiquing"
+  | "reflecting"
+  | "blocked"
+  | "offline";
+
+export interface AgentProfile {
+  id: AgentId;
+  name: AgentId;
+  role: string;
+  description: string;
+  tools: string[];
+  capabilities: string[];
+  memoryScope: string;
+  modelLabel: string;
+  containerLabel: string;
+  isolated: boolean;
+  sortOrder: number;
+}
+
+export interface AgentRuntimeStatus {
+  agentId: AgentId;
+  phase: AgentRuntimePhase;
+  online: boolean;
+  note?: string;
+  currentTaskId?: string;
+  currentTaskGoal?: string;
+  currentSubTaskId?: string;
+  currentSubTaskTitle?: string;
+  activeSubTasks: number;
+  completedSubTasks: number;
+  failedSubTasks: number;
+  blockedSubTasks: number;
+  lastUpdated: number;
+}
+
+export interface AgentSnapshot extends AgentProfile, AgentRuntimeStatus {}
+
+export interface AgentActivitySnapshot extends AgentSnapshot {
+  recentEntries: MemoryEntry[];
+}
+
 export interface Task {
   id: string;
   goal: string;
@@ -52,6 +110,8 @@ export interface SubTask {
   inputArtifacts: string[];
   outputArtifacts: string[];
   successCriteria: string[];
+  workspaceScope: string[];
+  lockedPaths: string[];
   retryCount: number;
   result?: string;
   error?: string;

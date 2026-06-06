@@ -51,3 +51,15 @@ Thumbs.db
 # Runtime
 dist/
 .turbo/
+
+# Markdown files
+*.md
+!README.md
+
+
+frontend-plan.md
+problems.md
+review.md
+TODO.md
+updatest_arch.md
+architecture.md

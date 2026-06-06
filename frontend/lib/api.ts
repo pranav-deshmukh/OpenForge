@@ -1,4 +1,4 @@
-import { Artifact, MemoryEntry, SubTask, SystemStatus, Task } from "./types";
+import { AgentActivitySnapshot, AgentSnapshot, Artifact, MemoryEntry, SubTask, SystemStatus, Task } from "./types";
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
 export const SOCKET_BASE = process.env.NEXT_PUBLIC_SOCKET_BASE_URL ?? API_BASE;
@@ -23,6 +23,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function getTasks(): Promise<Task[]> {
   return request<Task[]>("/tasks");
+}
+
+export function getAgents(): Promise<AgentSnapshot[]> {
+  return request<AgentSnapshot[]>("/agents");
+}
+
+export function getAgentActivity(): Promise<AgentActivitySnapshot[]> {
+  return request<AgentActivitySnapshot[]>("/agents/activity");
 }
 
 export function getTask(id: string): Promise<Task> {

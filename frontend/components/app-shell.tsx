@@ -2,41 +2,65 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import * as api from "@/lib/api";
-import { SystemStatus, Task } from "@/lib/types";
+import { SystemStatus } from "@/lib/types";
 
 type NavItem = {
   href: string;
   label: string;
+  icon: React.ReactNode;
 };
 
-const NAV_ITEMS: NavItem[] = [
-  { href: "/", label: "Home" },
-  { href: "/tasks", label: "Tasks" },
-  { href: "/feed", label: "Activity" },
-  { href: "/workspace", label: "Workspace" },
-  { href: "/memory", label: "Memory" },
-  { href: "/skills", label: "Skills" },
+type NavSection = {
+  label: string;
+  items: NavItem[];
+};
+
+function IconFrame({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="inline-flex h-4 w-4 items-center justify-center text-text-secondary">
+      {children}
+    </span>
+  );
+}
+
+const navSections: NavSection[] = [
+  {
+    label: "Overview",
+    items: [
+      { href: "/agents", label: "Agent Team", icon: <IconFrame>⌂</IconFrame> },
+      { href: "/briefings", label: "Agent Activity", icon: <IconFrame>≡</IconFrame> },
+    ],
+  },
+  {
+    label: "Operations",
+    items: [
+      { href: "/tasks", label: "Tasks", icon: <IconFrame>✓</IconFrame> },
+      { href: "/memory", label: "Memory", icon: <IconFrame>⌘</IconFrame> },
+      { href: "/workspace", label: "Workspace", icon: <IconFrame>◫</IconFrame> },
+    ],
+  },
+  {
+    label: "Configuration",
+    items: [
+      { href: "/skills", label: "Coding", icon: <IconFrame>{"</>"}</IconFrame> },
+    ],
+  },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const [tasks, setTasks] = useState<Task[]>([]);
   const [system, setSystem] = useState<SystemStatus | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
-    const fetchState = async () => {
+    const loadStatus = async () => {
       try {
-        const [fetchedTasks, fetchedSystem] = await Promise.all([
-          api.getTasks(),
-          api.getSystemStatus(),
-        ]);
+        const next = await api.getSystemStatus();
         if (!cancelled) {
-          setTasks(fetchedTasks || []);
-          setSystem(fetchedSystem);
+          setSystem(next);
         }
       } catch {
         if (!cancelled) {
@@ -45,154 +69,86 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       }
     };
 
-    fetchState();
-    const interval = setInterval(fetchState, 2000);
+    void loadStatus();
+    const interval = window.setInterval(loadStatus, 5000);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      window.clearInterval(interval);
     };
   }, []);
 
-  const activeTask = useMemo(
-    () => tasks.find((task) => task.status === "running") ?? tasks[0] ?? null,
-    [tasks],
-  );
-
-  const workspaceLabel =
-    system?.workspace.status === "running"
-      ? "Workspace ready"
-      : system?.workspace.status === "stopped"
-        ? "Workspace stopped"
-        : "Workspace missing";
+  const failedCount = (system?.tasks.failed ?? 0) + (system?.tasks.cancelled ?? 0);
 
   return (
-    <div className="min-h-screen bg-bg-base text-text-primary">
-      <header className="sticky top-0 z-30 border-b border-bg-border bg-bg-base">
-        <div className="flex h-14 items-center justify-between gap-4 px-4 md:px-6">
-          <div className="flex items-center gap-3">
-            <Link href="/" className="text-sm font-semibold tracking-tight">
-              OpenForge
-            </Link>
-            <span className="hidden text-xs text-text-secondary md:inline">
-              Autonomous research and engineering assistant
-            </span>
-          </div>
-          <div className="flex items-center gap-2 text-xs">
-            <span className={`rounded border px-2 py-1 ${system?.ready ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-zinc-500/30 bg-zinc-500/10 text-zinc-300"}`}>
-              {system?.ready ? "Ready" : "Offline"}
-            </span>
-            <span className={`hidden rounded border px-2 py-1 md:inline ${system?.workspace.status === "running" ? "border-sky-500/30 bg-sky-500/10 text-sky-300" : "border-zinc-500/30 bg-zinc-500/10 text-zinc-300"}`}>
-              {workspaceLabel}
-            </span>
-            <span className="hidden rounded border border-bg-border px-2 py-1 text-text-secondary md:inline">
-              Queue {system?.queue.pendingCount ?? 0}
-            </span>
-          </div>
-        </div>
-      </header>
+    <div className="min-h-screen">
+      <div className="mx-auto flex min-h-screen max-w-[1600px]">
+        <aside className="glass-panel hidden w-[184px] shrink-0 border-r border-bg-border px-5 py-7 md:block">
+          <Link href="/agents" className="mb-10 flex items-center gap-2">
+            <span className="font-display text-[2rem] leading-none tracking-tight">Forge</span>
+            <span className="mt-2 h-2.5 w-2.5 rounded-full bg-accent-gold" />
+          </Link>
 
-      <div className="mx-auto flex min-h-[calc(100vh-56px)] max-w-[1600px]">
-        <aside className="hidden w-56 shrink-0 border-r border-bg-border md:block">
-          <nav className="flex flex-col gap-1 p-3">
-            {NAV_ITEMS.map((item) => {
-              const active = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
-              return (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className={`rounded px-3 py-2 text-sm transition-colors ${
-                    active
-                      ? "bg-bg-surface text-text-primary"
-                      : "text-text-secondary hover:bg-bg-surface hover:text-text-primary"
-                  }`}
-                >
-                  {item.label}
-                </Link>
-              );
-            })}
-          </nav>
-        </aside>
-
-        <main className="min-w-0 flex-1">{children}</main>
-
-        <aside className="hidden h-[calc(100vh-56px)] w-80 shrink-0 border-l border-bg-border xl:block">
-          <div className="flex h-full min-h-0 flex-col p-4">
-            <section className="border-b border-bg-border pb-4">
-              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-text-secondary">
-                Current task
-              </div>
-              {activeTask ? (
-                <div className="space-y-2">
-                  <div className="text-sm leading-6">{activeTask.goal}</div>
-                  <div className="flex flex-wrap gap-2 text-xs text-text-secondary">
-                    <span className="rounded border border-bg-border px-2 py-1 capitalize">
-                      {activeTask.status}
-                    </span>
-                    <span className="rounded border border-bg-border px-2 py-1">
-                      {activeTask.mode ?? "routing"}
-                    </span>
-                    <span className="rounded border border-bg-border px-2 py-1">
-                      {activeTask.iterations ?? 0} steps
-                    </span>
-                  </div>
+          <nav className="space-y-8">
+            {navSections.map((section) => (
+              <section key={section.label}>
+                <div className="mb-3 text-[10px] uppercase tracking-[0.22em] text-text-dim">
+                  {section.label}
                 </div>
-              ) : (
-                <div className="text-sm text-text-secondary">No tasks yet.</div>
-              )}
-            </section>
+                <div className="space-y-1">
+                  {section.items.map((item) => {
+                    const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
+                    return (
+                      <Link
+                        key={`${section.label}-${item.label}`}
+                        href={item.href}
+                        className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] transition ${
+                          active
+                            ? "bg-[#ede6dc] text-text-primary"
+                            : "text-text-secondary hover:bg-[#f1ebe3] hover:text-text-primary"
+                        }`}
+                      >
+                        {item.icon}
+                        <span>{item.label}</span>
+                      </Link>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
+          </nav>
 
-            <section className="flex min-h-0 flex-1 flex-col border-b border-bg-border py-4">
-              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-text-secondary">
-                Queue
-              </div>
-              <div className="min-h-0 space-y-2 overflow-y-auto pr-1">
-                {(system?.queue.pending ?? []).slice(0, 5).map((task) => (
-                  <div key={task.id} className="rounded border border-bg-border px-3 py-2 text-sm">
-                    <div className="line-clamp-2">{task.goal}</div>
-                    <div className="mt-1 text-xs text-text-secondary">
-                      Waiting
-                    </div>
-                  </div>
-                ))}
-                {(system?.queue.pendingCount ?? 0) === 0 && (
-                  <div className="text-sm text-text-secondary">No queued tasks.</div>
-                )}
-              </div>
-            </section>
-
-            <section className="min-h-0 py-4">
-              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-text-secondary">
-                Recent tasks
-              </div>
-              <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
-                {tasks.slice(0, 6).map((task) => (
-                  <div key={task.id} className="rounded border border-bg-border px-3 py-2 text-sm">
-                    <div className="line-clamp-2">{task.goal}</div>
-                    <div className="mt-1 text-xs capitalize text-text-secondary">
-                      {task.status}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
+          <div className="mt-8">
+            <div className="inline-flex items-center gap-2 rounded-full border border-[#cb5f51] bg-[#d35c4d] px-4 py-2 text-xs text-white shadow-soft">
+              <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-white/40 bg-white/10">
+                {failedCount}
+              </span>
+              <span>{failedCount === 1 ? "Issue" : "Issues"}</span>
+            </div>
           </div>
         </aside>
+
+        <div className="min-w-0 flex-1 px-4 py-4 md:px-7 md:py-6">
+          <header className="mb-5 flex items-center justify-between rounded-2xl border border-bg-border bg-bg-surface/80 px-4 py-3 shadow-soft md:hidden">
+            <Link href="/agents" className="flex items-center gap-2">
+              <span className="font-display text-2xl tracking-tight">Forge</span>
+              <span className="mt-1 h-2 w-2 rounded-full bg-accent-gold" />
+            </Link>
+            <div className="text-xs text-text-secondary">
+              {system?.workspace.status === "running" ? "Workspace ready" : "Workspace offline"}
+            </div>
+          </header>
+
+          <main>{children}</main>
+        </div>
       </div>
 
-      <nav className="fixed bottom-0 left-0 right-0 z-30 flex h-14 items-center justify-around border-t border-bg-border bg-bg-surface md:hidden">
-        {NAV_ITEMS.slice(0, 4).map((item) => {
-          const active = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className={`px-2 text-xs ${active ? "text-text-primary" : "text-text-secondary"}`}
-            >
-              {item.label}
-            </Link>
-          );
-        })}
-      </nav>
+      <button
+        type="button"
+        className="fixed bottom-5 right-5 flex h-14 w-14 items-center justify-center rounded-full bg-[#2b2620] text-lg text-white shadow-soft transition hover:translate-y-[-1px]"
+        aria-label="Open chat"
+      >
+        ◫
+      </button>
     </div>
   );
 }

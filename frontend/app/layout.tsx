@@ -1,16 +1,5 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
-
-const inter = Inter({
-  variable: "--font-inter",
-  subsets: ["latin"],
-});
-
-const jetbrainsMono = JetBrains_Mono({
-  variable: "--font-jetbrains-mono",
-  subsets: ["latin"],
-});
 
 export const metadata: Metadata = {
   title: "OpenForge Mission Control",
@@ -23,8 +12,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable} h-full antialiased`}>
-      <body className="min-h-full font-sans bg-bg-base text-text-primary selection:bg-accent-purple selection:text-white">
+    <html lang="en" className="h-full antialiased">
+      <body className="min-h-full bg-bg-base font-sans text-text-primary selection:bg-accent-gold selection:text-white">
         {children}
       </body>
     </html>

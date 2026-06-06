@@ -48,6 +48,8 @@ db.exec(`
     inputArtifacts TEXT NOT NULL,
     outputArtifacts TEXT NOT NULL,
     successCriteria TEXT NOT NULL,
+    workspaceScope TEXT NOT NULL DEFAULT '[]',
+    lockedPaths TEXT NOT NULL DEFAULT '[]',
     retryCount INTEGER DEFAULT 0,
     result TEXT,
     error TEXT,
@@ -109,6 +111,12 @@ try {
   db.exec(`ALTER TABLE subtasks ADD COLUMN critique TEXT`);
 } catch {}
 try {
+  db.exec(`ALTER TABLE subtasks ADD COLUMN workspaceScope TEXT NOT NULL DEFAULT '[]'`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE subtasks ADD COLUMN lockedPaths TEXT NOT NULL DEFAULT '[]'`);
+} catch {}
+try {
   db.exec(`ALTER TABLE memory ADD COLUMN subTaskId TEXT`);
 } catch {}
 try {
@@ -126,6 +134,8 @@ function fromDbSubTask(row: any): SubTask {
     inputArtifacts: JSON.parse(row.inputArtifacts),
     outputArtifacts: JSON.parse(row.outputArtifacts),
     successCriteria: JSON.parse(row.successCriteria),
+    workspaceScope: JSON.parse(row.workspaceScope ?? '[]'),
+    lockedPaths: JSON.parse(row.lockedPaths ?? '[]'),
   };
 }
 
@@ -142,6 +152,8 @@ function toDbSubTask(subTask: SubTask): any {
     inputArtifacts: JSON.stringify(subTask.inputArtifacts),
     outputArtifacts: JSON.stringify(subTask.outputArtifacts),
     successCriteria: JSON.stringify(subTask.successCriteria),
+    workspaceScope: JSON.stringify(subTask.workspaceScope),
+    lockedPaths: JSON.stringify(subTask.lockedPaths),
   };
 }
 
@@ -268,11 +280,11 @@ export function createSubTask(subTask: Omit<SubTask, 'id' | 'createdAt' | 'updat
   db.prepare(`
     INSERT INTO subtasks (
       id, taskId, title, description, type, status, dependencies, priority, 
-      assignedAgent, inputArtifacts, outputArtifacts, successCriteria, 
+      assignedAgent, inputArtifacts, outputArtifacts, successCriteria, workspaceScope, lockedPaths,
       retryCount, createdAt, updatedAt
     ) VALUES (
       @id, @taskId, @title, @description, @type, @status, @dependencies, @priority, 
-      @assignedAgent, @inputArtifacts, @outputArtifacts, @successCriteria, 
+      @assignedAgent, @inputArtifacts, @outputArtifacts, @successCriteria, @workspaceScope, @lockedPaths,
       @retryCount, @createdAt, @updatedAt
     )
   `).run(dbSubTask);
@@ -305,6 +317,10 @@ export function getSubTask(id: string): SubTask | null {
 
 export function getSubTasksForTask(taskId: string): SubTask[] {
   return db.prepare('SELECT * FROM subtasks WHERE taskId = ? ORDER BY priority ASC, createdAt ASC').all(taskId).map(fromDbSubTask);
+}
+
+export function getAllSubTasks(): SubTask[] {
+  return db.prepare('SELECT * FROM subtasks ORDER BY createdAt ASC').all().map(fromDbSubTask);
 }
 
 // Reflections
@@ -399,6 +415,10 @@ export function getMemoryForSubTask(subTaskId: string): MemoryEntry[] {
 
 export function getAllMemory(): MemoryEntry[] {
   return db.prepare('SELECT * FROM memory ORDER BY createdAt DESC LIMIT 100').all() as MemoryEntry[];
+}
+
+export function getRecentMemoryEntries(limit = 500): MemoryEntry[] {
+  return db.prepare('SELECT * FROM memory ORDER BY createdAt DESC LIMIT ?').all(limit) as MemoryEntry[];
 }
 
 function appendToVault(entry: MemoryEntry) {

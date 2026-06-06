@@ -2,6 +2,64 @@ export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
 
 export type TaskMode = 'chat' | 'tool' | 'autonomous_dag';
 
+export type AgentId =
+  | 'Forge'
+  | 'Atlas'
+  | 'Sage'
+  | 'Cipher'
+  | 'Loom'
+  | 'Crucible'
+  | 'Sentry'
+  | 'Echo';
+
+export type AgentRuntimePhase =
+  | 'idle'
+  | 'routing'
+  | 'planning'
+  | 'delegating'
+  | 'working'
+  | 'verifying'
+  | 'critiquing'
+  | 'reflecting'
+  | 'blocked'
+  | 'offline';
+
+export interface AgentProfile {
+  id: AgentId;
+  name: AgentId;
+  role: string;
+  description: string;
+  tools: string[];
+  capabilities: string[];
+  memoryScope: string;
+  modelLabel: string;
+  containerLabel: string;
+  isolated: boolean;
+  sortOrder: number;
+}
+
+export interface AgentRuntimeStatus {
+  agentId: AgentId;
+  phase: AgentRuntimePhase;
+  online: boolean;
+  note?: string;
+  currentTaskId?: string;
+  currentTaskGoal?: string;
+  currentSubTaskId?: string;
+  currentSubTaskTitle?: string;
+  activeSubTasks: number;
+  completedSubTasks: number;
+  failedSubTasks: number;
+  blockedSubTasks: number;
+  lastUpdated: number;
+}
+
+export interface AgentSnapshot extends AgentProfile, AgentRuntimeStatus {}
+
+export interface AgentActivitySnapshot extends AgentSnapshot {
+  recentEntries: MemoryEntry[];
+}
+
 export interface Task {
   id: string;
   goal: string;
@@ -48,16 +106,18 @@ export interface SubTask {
   description: string;
   type: SubTaskType;
   status: SubTaskStatus;
-  dependencies: string[]; // titles of other subtasks
+  dependencies: string[];
   priority: number;
-  assignedAgent?: string;
+  assignedAgent?: AgentId;
   inputArtifacts: string[];
   outputArtifacts: string[];
   successCriteria: string[];
+  workspaceScope: string[];
+  lockedPaths: string[];
   retryCount: number;
   result?: string;
   error?: string;
-  critique?: string; // Feedback from critic agents
+  critique?: string;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;

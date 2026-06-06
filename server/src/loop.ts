@@ -16,13 +16,20 @@ import {
   createArtifact, getArtifactsForTask, createReflection,
   getMemoryForSubTask, compressContext, incrementTaskIterations
 } from './memory.js';
+import {
+  clearAgentAssignment,
+  emitDelegationEvent,
+  resolveAssignedAgent,
+  setAgentPhase,
+} from './agents.js';
 import { getSystemPrompt } from './prompts.js';
-import type { Message, Task, SubTask } from './types.js';
+import { releaseWorkspaceLocks, tryAcquireWorkspaceLocks } from './workspace-locks.js';
+import type { AgentId, Message, Task, SubTask } from './types.js';
 
 const MAX_ITERATIONS_PER_SUBTASK = 50;
 const MAX_ITERATIONS_TOOL_MODE = 15;
 const MAX_SUBTASK_RETRIES = 3;
-const CONCURRENT_WORKERS = 3;
+const CONCURRENT_WORKERS = 2;
 
 function isTaskCancelled(taskId: string): boolean {
   return getTask(taskId)?.status === 'cancelled';
@@ -97,6 +104,15 @@ function dependencyIdsFromTitles(
     .filter((value): value is string => Boolean(value));
 }
 
+function getSubTaskAgentId(subTask: SubTask): AgentId {
+  return subTask.assignedAgent || resolveAssignedAgent(subTask);
+}
+
+function hasRequiredArtifacts(task: Task, subTask: SubTask): boolean {
+  const artifactNames = new Set(getArtifactsForTask(task.id).map((artifact) => artifact.name));
+  return subTask.inputArtifacts.every((artifactName) => artifactNames.has(artifactName));
+}
+
 export async function processTask(task: Task): Promise<void> {
   try {
     let currentTask = getTask(task.id) || task;
@@ -141,9 +157,15 @@ export async function runAutonomousLoop(task: Task): Promise<void> {
 }
 
 async function routeTask(task: Task): Promise<Task['mode']> {
+  setAgentPhase('Forge', 'routing', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    note: 'Classifying request',
+  });
   const heuristic = heuristicRouteTask(task.goal);
   if (heuristic) {
     saveMemory(task.id, 'thought', `Routing to ${heuristic} mode using local heuristic.`, null, 'episodic');
+    clearAgentAssignment('Forge');
     return heuristic;
   }
 
@@ -154,11 +176,13 @@ async function routeTask(task: Task): Promise<Task['mode']> {
     const classification = JSON.parse(cleanJsonResponse(response));
     console.log(`[Router] Decision: ${classification.mode} (${classification.reasoning})`);
     saveMemory(task.id, 'thought', `Routing to ${classification.mode} mode. Reasoning: ${classification.reasoning}`, null, 'episodic');
+    clearAgentAssignment('Forge');
     return classification.mode;
   } catch (err) {
     const fallback = heuristicRouteTask(task.goal) ?? 'tool';
     console.error(`[Router] Failed to parse classification, defaulting to ${fallback}:`, err);
     saveMemory(task.id, 'error', `Router parse failed. Falling back to ${fallback} mode.`, null, 'working');
+    clearAgentAssignment('Forge');
     return fallback;
   }
 }
@@ -234,19 +258,31 @@ async function blockExistingFileOverwrite(
 
 async function runChatMode(task: Task) {
   updateTask(task.id, { status: 'running', startedAt: Date.now() });
+  setAgentPhase('Forge', 'working', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    note: 'Responding in chat mode',
+  });
   const systemPrompt = getSystemPrompt('chat', { task });
   const response = await callLLM(systemPrompt, task.goal, 'text/plain');
   if (isTaskCancelled(task.id)) {
+    clearAgentAssignment('Forge');
     return;
   }
   
   saveMemory(task.id, 'output', response, null, 'working');
   updateTask(task.id, { status: 'done', completedAt: Date.now(), result: response });
+  clearAgentAssignment('Forge');
   console.log(`[Chat] Response delivered.`);
 }
 
 async function runToolMode(task: Task) {
   updateTask(task.id, { status: 'running', startedAt: Date.now() });
+  setAgentPhase('Forge', 'working', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    note: 'Executing linear tool task',
+  });
   await ensureWorkspaceReady();
   
   const preinstalled = await getPreinstalledPackages();
@@ -271,6 +307,7 @@ If you need a package NOT in the above list, install it normally. It will persis
 
   for (let i = 1; i <= MAX_ITERATIONS_TOOL_MODE; i++) {
     if (isTaskCancelled(task.id)) {
+      clearAgentAssignment('Forge');
       return;
     }
     incrementTaskIterations(task.id);
@@ -318,6 +355,7 @@ If you need a package NOT in the above list, install it normally. It will persis
       if (!isTaskCancelled(task.id)) {
         updateTask(task.id, { status: 'done', completedAt: Date.now(), result: summary || 'Task completed via Tool mode.' });
       }
+      clearAgentAssignment('Forge');
       return;
     }
 
@@ -388,6 +426,7 @@ If you need a package NOT in the above list, install it normally. It will persis
   if (!isTaskCancelled(task.id)) {
     updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached in Tool mode' });
   }
+  clearAgentAssignment('Forge');
 }
 
 export async function runOrchestrator(task: Task): Promise<void> {
@@ -395,6 +434,11 @@ export async function runOrchestrator(task: Task): Promise<void> {
     console.log(`\n[Orchestrator] Starting: ${task.goal}`);
     updateTask(task.id, { status: 'running', startedAt: Date.now() });
     saveMemory(task.id, 'thought', `Starting orchestrated goal: ${task.goal}`, null, 'episodic');
+    setAgentPhase('Forge', 'planning', {
+      currentTaskId: task.id,
+      currentTaskGoal: task.goal,
+      note: 'Planning with Atlas',
+    });
 
     await ensureWorkspaceReady();
 
@@ -411,13 +455,14 @@ export async function runOrchestrator(task: Task): Promise<void> {
       }
       incrementTaskIterations(task.id);
       const subTasks = getSubTasksForTask(task.id);
-      const unblocked = subTasks.filter(st => 
-        st.status === 'pending' && 
+      const unblocked = subTasks.filter(st =>
+        ['pending', 'blocked'].includes(st.status) &&
         !activeSubTasks.has(st.id) &&
         st.dependencies.every(depId => {
           const dep = subTasks.find(s => s.id === depId);
           return dep && dep.status === 'done';
-        })
+        }) &&
+        hasRequiredArtifacts(task, st)
       );
 
       if (unblocked.length === 0 && activeSubTasks.size === 0) {
@@ -440,11 +485,44 @@ export async function runOrchestrator(task: Task): Promise<void> {
       const toDispatch = unblocked.slice(0, CONCURRENT_WORKERS - activeSubTasks.size);
       
       for (const subTask of toDispatch) {
+        const requestedLocks = subTask.lockedPaths.length > 0 ? subTask.lockedPaths : subTask.workspaceScope;
+        const lockResult = tryAcquireWorkspaceLocks(subTask.id, requestedLocks);
+        if (!lockResult.ok) {
+          updateSubTask(subTask.id, {
+            status: 'blocked',
+            error: `Waiting for workspace locks: ${lockResult.conflicts.join(', ')}`,
+          });
+          continue;
+        }
+
+        if (subTask.status === 'blocked') {
+          updateSubTask(subTask.id, { status: 'pending', error: undefined });
+        }
+
         activeSubTasks.add(subTask.id);
+        setAgentPhase('Forge', 'delegating', {
+          currentTaskId: task.id,
+          currentTaskGoal: task.goal,
+          currentSubTaskId: subTask.id,
+          currentSubTaskTitle: subTask.title,
+          note: `Delegating ${subTask.title} to ${getSubTaskAgentId(subTask)}`,
+        });
+        emitDelegationEvent('start', {
+          from: 'Forge',
+          to: getSubTaskAgentId(subTask),
+          taskId: task.id,
+          taskGoal: task.goal,
+          subTaskId: subTask.id,
+          subTaskTitle: subTask.title,
+          note: subTask.description,
+        });
         console.log(`[Orchestrator] Dispatching Worker for: ${subTask.title}`);
         dispatchWorker(task, subTask).catch(err => {
           console.error(`[Orchestrator] Worker failed for ${subTask.title}:`, err);
-        }).finally(() => activeSubTasks.delete(subTask.id));
+        }).finally(() => {
+          activeSubTasks.delete(subTask.id);
+          releaseWorkspaceLocks(subTask.id);
+        });
       }
 
       // Wait a bit before checking status again
@@ -460,6 +538,7 @@ export async function runOrchestrator(task: Task): Promise<void> {
       artifactNames.length > 0 ? `Artifacts: ${artifactNames.join(', ')}` : '',
     ].filter(Boolean).join('\n');
     updateTask(task.id, { status: 'done', completedAt: Date.now(), result });
+    clearAgentAssignment('Forge');
   } catch (err: any) {
     if (err.message === 'Task cancelled by user' || isTaskCancelled(task.id)) {
       return;
@@ -467,11 +546,22 @@ export async function runOrchestrator(task: Task): Promise<void> {
     console.error('[Orchestrator] Fatal error:', err);
     updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: err.message || 'Fatal orchestrator error' });
     saveMemory(task.id, 'error', `Fatal orchestrator error: ${err.message || err}`, null, 'working');
+    clearAgentAssignment('Forge');
   }
 }
 
 async function dispatchWorker(task: Task, subTask: SubTask) {
+  const assignedAgent = getSubTaskAgentId(subTask);
   if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    emitDelegationEvent('complete', {
+      from: 'Forge',
+      to: assignedAgent,
+      taskId: task.id,
+      taskGoal: task.goal,
+      subTaskId: subTask.id,
+      subTaskTitle: subTask.title,
+      note: 'Cancelled before execution',
+    });
     return;
   }
   console.log(`\n[Orchestrator] Dispatching Worker for: ${subTask.title}`);
@@ -480,6 +570,15 @@ async function dispatchWorker(task: Task, subTask: SubTask) {
   // Verification Phase
   const updatedSubTask = getSubTask(subTask.id);
   if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    emitDelegationEvent('complete', {
+      from: 'Forge',
+      to: assignedAgent,
+      taskId: task.id,
+      taskGoal: task.goal,
+      subTaskId: subTask.id,
+      subTaskTitle: subTask.title,
+      note: 'Cancelled during execution',
+    });
     return;
   }
   if (updatedSubTask && updatedSubTask.status === 'done') {
@@ -498,10 +597,26 @@ async function dispatchWorker(task: Task, subTask: SubTask) {
   } else if (updatedSubTask && updatedSubTask.status === 'failed') {
     await handleSubTaskFailure(task, updatedSubTask, 'execution');
   }
+
+  emitDelegationEvent('complete', {
+    from: 'Forge',
+    to: assignedAgent,
+    taskId: task.id,
+    taskGoal: task.goal,
+    subTaskId: subTask.id,
+    subTaskTitle: subTask.title,
+    note: getSubTask(subTask.id)?.status ?? 'unknown',
+  });
+  clearAgentAssignment(assignedAgent);
 }
 
 async function planTask(task: Task) {
   console.log('[Planner] Decomposing goal...');
+  setAgentPhase('Atlas', 'planning', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    note: 'Generating initial DAG',
+  });
   const systemPrompt = getSystemPrompt('planner', { task });
   const response = await callLLM(systemPrompt, `Plan the execution for: ${task.goal}`);
   
@@ -523,9 +638,12 @@ async function planTask(task: Task) {
         type: st.type,
         dependencies: [],
         priority: st.priority || 0,
+        assignedAgent: st.assignedAgent || resolveAssignedAgent(st),
         inputArtifacts: st.inputArtifacts || [],
         outputArtifacts: st.outputArtifacts || [],
         successCriteria: st.successCriteria || [],
+        workspaceScope: st.workspaceScope || [],
+        lockedPaths: st.lockedPaths || [],
       }),
     );
     const titleToId = new Map<string, string>(
@@ -540,9 +658,11 @@ async function planTask(task: Task) {
       throw new Error('Planner returned no subtasks.');
     }
     saveMemory(task.id, 'thought', `Planner generated ${plan.subTasks.length} subtasks.`, null, 'episodic');
+    clearAgentAssignment('Atlas');
   } catch (err) {
     console.error('[Planner] Failed to parse plan:', err);
     saveMemory(task.id, 'error', `Planner failed: ${response}`, null, 'working');
+    clearAgentAssignment('Atlas');
     throw err;
   }
 }
@@ -664,7 +784,20 @@ const WORKER_TOOLS: ToolDefinition[] = [
 ];
 
 async function runWorkerAgent(task: Task, subTask: SubTask) {
-  updateSubTask(subTask.id, { status: 'running', startedAt: Date.now() });
+  const assignedAgent = getSubTaskAgentId(subTask);
+  updateSubTask(subTask.id, {
+    status: 'running',
+    startedAt: Date.now(),
+    assignedAgent,
+    error: undefined,
+  });
+  setAgentPhase(assignedAgent, 'working', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    currentSubTaskId: subTask.id,
+    currentSubTaskTitle: subTask.title,
+    note: subTask.description,
+  });
   saveMemory(task.id, 'thought', `Worker starting subtask: ${subTask.title}`, subTask.id, 'working');
 
   const preinstalled = await getPreinstalledPackages();
@@ -690,6 +823,7 @@ If you need a package NOT in the above list, install it normally. It will persis
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
     if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+      clearAgentAssignment(assignedAgent);
       return;
     }
     incrementTaskIterations(task.id);
@@ -755,8 +889,22 @@ If you need a package NOT in the above list, install it normally. It will persis
     if (toolCall.name === 'ask_user') {
       saveMemory(task.id, 'thought', `[${subTask.title}] WAITING FOR USER: ${toolCall.args.question}`, subTask.id, 'working');
       updateSubTask(subTask.id, { status: 'waiting_for_human' });
+      setAgentPhase(assignedAgent, 'blocked', {
+        currentTaskId: task.id,
+        currentTaskGoal: task.goal,
+        currentSubTaskId: subTask.id,
+        currentSubTaskTitle: subTask.title,
+        note: toolCall.args.question,
+      });
       lastProcessedInputTime = await waitForUserInput(task.id, subTask.id, lastProcessedInputTime);
       updateSubTask(subTask.id, { status: 'running' });
+      setAgentPhase(assignedAgent, 'working', {
+        currentTaskId: task.id,
+        currentTaskGoal: task.goal,
+        currentSubTaskId: subTask.id,
+        currentSubTaskTitle: subTask.title,
+        note: subTask.description,
+      });
       i--;
       continue;
     }
@@ -838,19 +986,29 @@ If you need a package NOT in the above list, install it normally. It will persis
   if (!isTaskCancelled(task.id) && !isSubTaskCancelled(subTask.id)) {
     updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached' });
   }
+  clearAgentAssignment(assignedAgent);
 }
 
 async function runSecurityAudit(task: Task, command: string, subTask: SubTask): Promise<boolean> {
   if (isTaskCancelled(task.id)) {
     return false;
   }
+  setAgentPhase('Sentry', 'working', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    currentSubTaskId: subTask.id,
+    currentSubTaskTitle: subTask.title,
+    note: `Auditing command: ${command.slice(0, 120)}`,
+  });
   const systemPrompt = getSystemPrompt('security', { task, subTask });
   const response = await callLLM(systemPrompt, `Proposed Command: ${command}`);
   
   try {
     const audit = JSON.parse(cleanJsonResponse(response));
+    clearAgentAssignment('Sentry');
     return !!audit.safe;
   } catch {
+    clearAgentAssignment('Sentry');
     return false; // Default to unsafe on error
   }
 }
@@ -860,6 +1018,13 @@ async function verifySubTask(task: Task, subTask: SubTask): Promise<boolean> {
     return false;
   }
   console.log(`[Verifier] Validating: ${subTask.title}`);
+  setAgentPhase('Crucible', 'verifying', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    currentSubTaskId: subTask.id,
+    currentSubTaskTitle: subTask.title,
+    note: 'Running verification checks',
+  });
   updateSubTask(subTask.id, { status: 'verifying' });
   const systemPrompt = getSystemPrompt('verifier', { task, subTask });
   const response = await callLLM(systemPrompt, `Verify the completion of: ${subTask.title}\nResult: ${subTask.result}`);
@@ -885,6 +1050,7 @@ async function verifySubTask(task: Task, subTask: SubTask): Promise<boolean> {
   if (!passed) {
     updateSubTask(subTask.id, { status: 'failed', error: result.feedback || 'Verification failed' });
   }
+  clearAgentAssignment('Crucible');
   return passed;
 }
 
@@ -893,6 +1059,13 @@ async function runCriticLoop(task: Task, subTask: SubTask): Promise<boolean> {
     return false;
   }
   console.log(`[Critic] Reviewing: ${subTask.title}`);
+  setAgentPhase('Crucible', 'critiquing', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    currentSubTaskId: subTask.id,
+    currentSubTaskTitle: subTask.title,
+    note: 'Reviewing implementation quality',
+  });
   updateSubTask(subTask.id, { status: 'critiquing' });
   const systemPrompt = getSystemPrompt('critic', { task, subTask });
   const response = await callLLM(systemPrompt, `Critique the work done for: ${subTask.title}\nSummary: ${subTask.result}`);
@@ -920,6 +1093,7 @@ async function runCriticLoop(task: Task, subTask: SubTask): Promise<boolean> {
   } else {
     updateSubTask(subTask.id, { status: 'done' });
   }
+  clearAgentAssignment('Crucible');
   return passed;
 }
 
@@ -928,6 +1102,13 @@ async function handleSubTaskFailure(task: Task, subTask: SubTask, phase: string)
     return;
   }
   console.log(`[Reflection] Analyzing ${phase} failure for: ${subTask.title}`);
+  setAgentPhase('Echo', 'reflecting', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    currentSubTaskId: subTask.id,
+    currentSubTaskTitle: subTask.title,
+    note: `Analyzing ${phase} failure`,
+  });
   const systemPrompt = getSystemPrompt('reflection', { task, subTask });
   const response = await callLLM(systemPrompt, `Analyze why ${subTask.title} failed in ${phase} phase.`);
   
@@ -952,6 +1133,7 @@ async function handleSubTaskFailure(task: Task, subTask: SubTask, phase: string)
   } else {
     updateSubTask(subTask.id, { status: 'failed' });
   }
+  clearAgentAssignment('Echo');
 }
 
 async function reflectAndReplan(task: Task) {
@@ -959,6 +1141,11 @@ async function reflectAndReplan(task: Task) {
     return;
   }
   console.log('[Orchestrator] Replanning...');
+  setAgentPhase('Atlas', 'planning', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    note: 'Replanning blocked DAG',
+  });
   const subTasks = getSubTasksForTask(task.id);
   const artifacts = getArtifactsForTask(task.id);
   const systemPrompt = getSystemPrompt('planner', { task, allSubTasks: subTasks, artifacts });
@@ -977,9 +1164,12 @@ async function reflectAndReplan(task: Task) {
           type: st.type,
           dependencies: [],
           priority: st.priority || 0,
+          assignedAgent: st.assignedAgent || resolveAssignedAgent(st),
           inputArtifacts: st.inputArtifacts || [],
           outputArtifacts: st.outputArtifacts || [],
           successCriteria: st.successCriteria || [],
+          workspaceScope: st.workspaceScope || [],
+          lockedPaths: st.lockedPaths || [],
         }),
     );
     const titleToId = new Map<string, string>(
@@ -990,8 +1180,10 @@ async function reflectAndReplan(task: Task) {
         dependencies: dependencyIdsFromTitles(newSubTasks[index].dependencies || [], titleToId),
       });
     }
+    clearAgentAssignment('Atlas');
   } catch (err) {
     console.error('[Orchestrator] Replanning failed to parse:', err);
+    clearAgentAssignment('Atlas');
   }
 }
 

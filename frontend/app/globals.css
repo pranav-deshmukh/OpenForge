@@ -1,80 +1,130 @@
 @import "tailwindcss";
 
 :root {
-  --bg-base: #080808;
-  --bg-surface: #0f0f0f;
-  --bg-elevated: #161616;
-  --bg-border: #222222;
+  --bg-base: #f5f1ea;
+  --bg-surface: #fffdfa;
+  --bg-elevated: #fffaf3;
+  --bg-panel: rgba(255, 253, 250, 0.78);
+  --bg-border: #e7ddd0;
+  --bg-border-strong: #d8cab8;
 
-  --text-primary: #f0f0f0;
-  --text-secondary: #888888;
-  --text-dim: #444444;
+  --text-primary: #211d18;
+  --text-secondary: #6e6256;
+  --text-dim: #9f9386;
 
-  --accent-purple: #7c3aed;
-  --accent-blue: #2563eb;
-  --accent-green: #16a34a;
-  --accent-red: #dc2626;
-  --accent-yellow: #ca8a04;
-  --accent-orange: #ea580c;
+  --accent-gold: #d5912b;
+  --accent-green: #2ea36b;
+  --accent-red: #be5b47;
+  --accent-purple: #8a67c7;
+  --accent-blue: #467ec1;
+  --accent-orange: #cc7a3c;
+  --accent-ink: #332b23;
+  --accent-wash: #f1e4cf;
 
-  --glow-purple: 0 0 20px rgba(124, 58, 237, 0.3);
-  --glow-green: 0 0 20px rgba(22, 163, 74, 0.3);
+  --shadow-soft: 0 18px 45px rgba(62, 44, 22, 0.07);
 }
 
 @theme inline {
   --color-bg-base: var(--bg-base);
   --color-bg-surface: var(--bg-surface);
   --color-bg-elevated: var(--bg-elevated);
+  --color-bg-panel: var(--bg-panel);
   --color-bg-border: var(--bg-border);
+  --color-bg-border-strong: var(--bg-border-strong);
 
   --color-text-primary: var(--text-primary);
   --color-text-secondary: var(--text-secondary);
   --color-text-dim: var(--text-dim);
 
-  --color-accent-purple: var(--accent-purple);
-  --color-accent-blue: var(--accent-blue);
+  --color-accent-gold: var(--accent-gold);
   --color-accent-green: var(--accent-green);
   --color-accent-red: var(--accent-red);
-  --color-accent-yellow: var(--accent-yellow);
+  --color-accent-purple: var(--accent-purple);
+  --color-accent-blue: var(--accent-blue);
   --color-accent-orange: var(--accent-orange);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-wash: var(--accent-wash);
 
-  --font-sans: var(--font-inter);
-  --font-mono: var(--font-jetbrains-mono);
+  --font-sans: "Aptos", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-mono: "Consolas", "SFMono-Regular", "Courier New", monospace;
+  --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
 }
 
 body {
-  background-color: var(--bg-base);
+  min-height: 100%;
+  margin: 0;
   color: var(--text-primary);
-  font-family: var(--font-inter), system-ui, sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(220, 193, 154, 0.22), transparent 32%),
+    radial-gradient(circle at top right, rgba(255, 255, 255, 0.9), transparent 25%),
+    linear-gradient(180deg, #f8f4ee 0%, #f3ede4 100%);
+  font-family: var(--font-sans), sans-serif;
 }
 
-@keyframes pulse-opacity {
-  0%,
-  100% {
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(213, 145, 43, 0.24);
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
     opacity: 1;
-  }
-  50% {
-    opacity: 0.4;
+    transform: translateY(0);
   }
 }
 
-.animate-pulse-opacity {
-  animation: pulse-opacity 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+.animate-fade-up {
+  animation: fade-up 380ms ease-out both;
+}
+
+.glass-panel {
+  background: var(--bg-panel);
+  backdrop-filter: blur(20px);
+}
+
+.shadow-soft {
+  box-shadow: var(--shadow-soft);
 }
 
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
+
 ::-webkit-scrollbar-track {
-  background: var(--bg-base);
+  background: transparent;
 }
+
 ::-webkit-scrollbar-thumb {
-  background: var(--bg-border);
-  border-radius: 3px;
+  background: rgba(100, 82, 62, 0.18);
+  border-radius: 999px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--text-dim);
+  background: rgba(100, 82, 62, 0.28);
 }
 
 .memory-markdown ul,
