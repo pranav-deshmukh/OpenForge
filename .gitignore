@@ -8,7 +8,6 @@ pnpm-lock.yaml
 .env
 .env.local
 .env.*.local
-prompt.md
 
 # Build outputs
 dist/
@@ -22,6 +21,7 @@ out/
 .cache/
 .parcel-cache/
 workspace/
+!frontend/app/workspace/
 
 # Database files
 *.db
@@ -55,11 +55,3 @@ dist/
 # Markdown files
 *.md
 !README.md
-
-
-frontend-plan.md
-problems.md
-review.md
-TODO.md
-updatest_arch.md
-architecture.md

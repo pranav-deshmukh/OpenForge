@@ -27,6 +27,12 @@ function IconFrame({ children }: { children: React.ReactNode }) {
 
 const navSections: NavSection[] = [
   {
+    label: "Launch",
+    items: [
+      { href: "/", label: "New Mission", icon: <IconFrame>◈</IconFrame> },
+    ],
+  },
+  {
     label: "Overview",
     items: [
       { href: "/agents", label: "Agent Team", icon: <IconFrame>⌂</IconFrame> },
@@ -80,9 +86,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const failedCount = (system?.tasks.failed ?? 0) + (system?.tasks.cancelled ?? 0);
 
   return (
-    <div className="min-h-screen">
-      <div className="mx-auto flex min-h-screen max-w-[1600px]">
-        <aside className="glass-panel hidden w-[184px] shrink-0 border-r border-bg-border px-5 py-7 md:block">
+    <div className="h-screen overflow-hidden">
+      <div className="mx-auto flex h-full max-w-[1600px]">
+        <aside className="glass-panel hidden w-[184px] shrink-0 overflow-y-auto border-r border-bg-border px-5 py-7 md:block">
           <Link href="/agents" className="mb-10 flex items-center gap-2">
             <span className="font-display text-[2rem] leading-none tracking-tight">Forge</span>
             <span className="mt-2 h-2.5 w-2.5 rounded-full bg-accent-gold" />
@@ -117,17 +123,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             ))}
           </nav>
 
-          <div className="mt-8">
+          {/* <div className="mt-8">
             <div className="inline-flex items-center gap-2 rounded-full border border-[#cb5f51] bg-[#d35c4d] px-4 py-2 text-xs text-white shadow-soft">
               <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-white/40 bg-white/10">
                 {failedCount}
               </span>
               <span>{failedCount === 1 ? "Issue" : "Issues"}</span>
             </div>
-          </div>
+          </div> */}
         </aside>
 
-        <div className="min-w-0 flex-1 px-4 py-4 md:px-7 md:py-6">
+        <div className="min-w-0 flex-1 overflow-y-auto px-4 py-4 md:px-7 md:py-6">
           <header className="mb-5 flex items-center justify-between rounded-2xl border border-bg-border bg-bg-surface/80 px-4 py-3 shadow-soft md:hidden">
             <Link href="/agents" className="flex items-center gap-2">
               <span className="font-display text-2xl tracking-tight">Forge</span>

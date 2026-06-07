@@ -56,7 +56,7 @@ export function AgentActivityCard({ agent }: { agent: AgentActivitySnapshot }) {
 
   return (
     <article
-      className={`animate-fade-up rounded-[22px] border bg-bg-surface p-5 shadow-soft ${
+      className={`animate-fade-up h-[420px] overflow-y-auto rounded-[22px] border bg-bg-surface p-5 shadow-soft ${
         isForge ? "border-[#e0c98f]" : "border-bg-border"
       }`}
     >

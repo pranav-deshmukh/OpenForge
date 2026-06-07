@@ -1,147 +1,436 @@
 # OpenForge
 
-A self learning and improving autonomous AI research agent designed to assist with complex research tasks, code execution, debugging, and building new stuff. Built with a skill-based architecture.
+## Autonomous AI Engineering Workforce
 
-## Overview
+OpenForge is an autonomous AI workforce built around a swarm of specialized AI agents that collaboratively plan, execute, validate, secure, and improve complex projects.
 
-PhD Agent is an agentic framework that combines:
+Unlike traditional AI assistants that operate as individual contributors, OpenForge functions as a coordinated engineering organization. A single user objective is transformed into a structured execution plan, distributed across specialized agents, validated through multiple review stages, and delivered as a complete outcome.
 
-- **LLM-Driven Autonomy**: Uses Claude to reason about tasks and select appropriate skills
-- **Skill Catalog**: Modular skills for web research, code execution, debugging, file management, and paper writing
-- **Docker Integration**: Runs in isolated Docker containers with full shell access
-- **Memory System**: Maintains context across multiple interactions
-- **Task Queue**: Handles async task management
+**Hackathon Theme:** Agent Swarms
 
-## Architecture
+---
 
-The agent operates in a simple loop:
+# The Problem
 
-1. Receive a goal/task
-2. Access skill catalog (names + descriptions)
-3. Execute shell commands in persistent Docker container
-4. Read skill files as needed
-5. Install packages, write files, run code
-6. Debug and iterate until task completion
+Modern AI assistants can generate code, answer questions, summarize information, and automate individual tasks.
 
-No hardcoded actions—just shell access and skills.
+However, complex projects require much more than individual task execution.
 
-## Project Structure
+Real-world work involves:
 
+- Planning and decomposition
+- Research
+- Backend development
+- Frontend development
+- Security reviews
+- Validation and quality assurance
+- Continuous learning and improvement
+
+Current AI systems typically rely on a single model attempting to perform all of these responsibilities simultaneously.
+
+As project complexity grows, coordination becomes the bottleneck.
+
+OpenForge addresses this challenge through a coordinated workforce of specialized AI agents.
+
+---
+
+# The Solution
+
+OpenForge converts a high-level objective into a complete execution workflow.
+
+Example:
+
+> Build a financial analytics dashboard from uploaded sales data.
+
+OpenForge automatically:
+
+1. Understands the objective
+2. Creates an execution strategy
+3. Generates a dependency graph of tasks
+4. Assigns work to specialized agents
+5. Executes tasks in parallel
+6. Performs security reviews
+7. Validates outputs
+8. Stores learnings
+9. Delivers final results
+
+The result is an autonomous engineering workflow rather than a single AI response.
+
+---
+
+# Agent Workforce
+
+## Atlas — Planning Agent
+
+Atlas analyzes objectives and generates structured execution plans.
+
+Responsibilities:
+
+- Goal analysis
+- Task decomposition
+- Dependency management
+- DAG generation
+- Execution planning
+
+---
+
+## Sage — Research Agent
+
+Sage gathers information and supports decision making.
+
+Responsibilities:
+
+- Web research
+- Knowledge discovery
+- Technology evaluation
+- Information synthesis
+
+---
+
+## Cipher — Backend Engineering Agent
+
+Cipher focuses on implementation and system logic.
+
+Responsibilities:
+
+- API development
+- Business logic
+- Data processing
+- Backend architecture
+
+---
+
+## Loom — Frontend Engineering Agent
+
+Loom creates user-facing experiences.
+
+Responsibilities:
+
+- User interfaces
+- Dashboards
+- Visualizations
+- Frontend implementation
+
+---
+
+## Sentry — Security Agent
+
+Sentry protects the execution environment.
+
+Responsibilities:
+
+- Command auditing
+- Risk detection
+- Security reviews
+- Safety enforcement
+
+---
+
+## Crucible — Validation Agent
+
+Crucible verifies outputs before delivery.
+
+Responsibilities:
+
+- Functional validation
+- Quality assurance
+- Architecture review
+- Critique and scoring
+
+---
+
+## Echo — Reflection Agent
+
+Echo captures organizational learning.
+
+Responsibilities:
+
+- Post-task analysis
+- Reflection generation
+- Knowledge retention
+- Memory updates
+
+---
+
+## Forge — Orchestrator
+
+Forge coordinates the entire workforce.
+
+Responsibilities:
+
+- Agent coordination
+- Task routing
+- Dependency management
+- Progress tracking
+- Swarm orchestration
+
+Forge ensures all agents contribute toward a shared objective.
+
+---
+
+# System Architecture
+
+```text
+User Goal
+    │
+    ▼
+ Router
+    │
+    ▼
+ Atlas (Planner)
+    │
+ Creates DAG
+    │
+    ▼
+ Forge (Coordinator)
+ ┌──────────┬──────────┬──────────┐
+ ▼          ▼          ▼
+Sage      Cipher      Loom
+Research  Backend     Frontend
+     ▼
+  Sentry
+ Security
+     ▼
+ Crucible
+ Validation
+     ▼
+   Echo
+ Reflection
+     ▼
+ Final Output
 ```
-phd-agent/
-├── frontend/              # Next.js UI dashboard
-├── server/               # Agent backend
+
+---
+
+# How OpenForge Works
+
+## Step 1 — Mission Creation
+
+The user provides a high-level objective.
+
+Example:
+
+> Build a financial analytics dashboard from sales data.
+
+---
+
+## Step 2 — Planning
+
+Atlas analyzes the objective and creates a Directed Acyclic Graph (DAG) of tasks.
+
+Tasks are decomposed into smaller executable units with dependencies.
+
+---
+
+## Step 3 — Parallel Execution
+
+Forge coordinates execution across specialized agents.
+
+Independent tasks execute simultaneously.
+
+Examples:
+
+- Research
+- Backend implementation
+- Frontend implementation
+
+---
+
+## Step 4 — Security Review
+
+Sentry evaluates commands and execution behavior before acceptance.
+
+Potentially unsafe actions are identified and reviewed.
+
+---
+
+## Step 5 — Validation
+
+Crucible performs quality checks including:
+
+- Functional verification
+- Output validation
+- Architecture review
+- Critique generation
+
+---
+
+## Step 6 — Reflection
+
+Echo analyzes execution results and stores learnings for future tasks.
+
+This creates organizational memory and continuous improvement.
+
+---
+
+## Core Features
+
+### Multi-Agent Workforce
+
+Specialized agents collaborate rather than relying on a single AI model.
+
+### Autonomous Planning
+
+Objectives are transformed into executable workflows.
+
+### DAG-Based Execution
+
+Tasks are structured using dependency graphs.
+
+### Parallel Processing
+
+Independent tasks execute simultaneously.
+
+### Security Review
+
+Commands are audited before execution.
+
+### Validation Pipeline
+
+Outputs undergo structured verification.
+
+### Reflection System
+
+Learnings are preserved and reused.
+
+### Extensible Skills
+
+Agents can use existing skills or create new skills for reusable workflows.
+
+---
+
+# Technology Stack
+
+## Frontend
+
+- Next.js
+- React
+- TypeScript
+- Tailwind CSS
+
+## Backend
+
+- Node.js
+- TypeScript
+
+## AI
+
+- Google Gemini
+
+## Memory
+
+- SQLite
+
+## Execution Environment
+
+- Docker
+
+## Research
+
+- Tavily
+
+---
+
+# Project Structure
+
+```text
+OpenForge/
+├── frontend/
+│   ├── app/
+│   ├── components/
+│   └── lib/
+│
+├── server/
 │   ├── src/
-│   │   ├── agent.ts      # LLM interaction
-│   │   ├── loop.ts       # Agent loop
-│   │   ├── shell.ts      # Docker container shell
-│   │   ├── skills.ts     # Skill discovery
-│   │   ├── memory.ts     # Context management
-│   │   └── index.ts      # Entry point
-│   └── skills/           # Skill modules
+│   │   ├── agent.ts
+│   │   ├── loop.ts
+│   │   ├── memory.ts
+│   │   ├── queue.ts
+│   │   ├── shell.ts
+│   │   ├── skills.ts
+│   │   └── index.ts
+│   │
+│   └── skills/
 │       ├── web-research/
-│       ├── code-executor/
-│       ├── file-manager/
 │       ├── debugger/
-│       └── paper-writer/
+│       ├── file-manager/
+│       ├── code-executor/
+│       ├── paper-writer/
+│       └── system-monitor/
+│
+└── architecture.md
 ```
 
-## Available Skills
+---
 
-- **Web Research**: Search and analyze information from the web
-- **Code Executor**: Execute and test code snippets
-- **File Manager**: Create, modify, and manage files
-- **Debugger**: Debug and diagnose code issues
-- **Paper Writer**: Assist with academic writing and documentation
+# Setup Instructions
 
-## Getting Started
-
-### Prerequisites
+## Prerequisites
 
 - Node.js 18+
-- Docker (for agent execution environment)
-- Google GenAI API key
+- Docker
+- Gemini API Key
 
-### Installation
+## Installation
 
 ```bash
-# Install server dependencies
+git clone <repository-url>
+
 cd server
 npm install
 
-# Install frontend dependencies
 cd ../frontend
 npm install
 ```
 
-### Configuration
-
-Create `.env` file in the `server/` directory:
+Create a `.env` file inside `server`:
 
 ```env
-GEMINI_API_KEY=your_api_key_here
+GEMINI_API_KEY=YOUR_API_KEY
 ```
 
-### Running the Agent
+Run backend:
 
 ```bash
-# Start the backend agent
 cd server
 npm run dev
+```
 
-# In another terminal, start the frontend
+Run frontend:
+
+```bash
 cd frontend
 npm run dev
 ```
 
-The agent will be available at `http://localhost:3000` (frontend) with the backend running on `http://localhost:3000` (API).
+Open:
 
-## How It Works
-
-1. **Goal Input**: Submit a research or coding goal
-2. **Skill Selection**: Agent analyzes available skills and selects appropriate ones
-3. **Execution**: Runs commands in Docker, reads skill documentation, installs dependencies
-4. **Iteration**: Debugs issues, refines approach, loops until goal completion
-5. **Results**: Returns structured results and maintains memory for context
-
-## Development
-
-### Adding a New Skill
-
-Create a new skill directory with a `SKILL.md` file:
-
-```
-server/skills/your-skill/
-└── SKILL.md
+```text
+http://localhost:3000
 ```
 
-Document the skill's purpose, inputs, outputs, and examples in the SKILL.md file.
+---
 
-### Resetting the workspace environment
+# Future Roadmap
 
-If you need to wipe your installed packages and start fresh (e.g. to clear a broken global install), you can run:
+- Semantic vector memory
+- MCP integration
+- Distributed execution
+- Enterprise authentication
+- Long-term memory systems
+- Agent marketplace
+- Multi-node orchestration
 
-```bash
-docker rm -f phd-agent-workspace
-docker rmi phd-agent-workspace:latest
-docker volume rm openforge-npm-global openforge-npm-bin openforge-pip-packages openforge-pip-bin openforge-root-cache openforge-root-local
-```
+---
 
-This will force the server to rebuild the base image and recreate the named volumes on the next run.
+# Team
 
-## Technologies
+## Pranav Deshmukh
 
-- **Frontend**: Next.js 16, React 19, Tailwind CSS
-- **Backend**: Node.js, Express, TypeScript
-- **Database**: SQLite (better-sqlite3)
-- **Container**: Docker
-- **AI**: Google GenAI (Gemini)
-- **Research**: Tavily API
+Project Lead, Architecture, Full Stack Development, Agent Design
 
-## License
+---
 
-MIT
+# License
 
-## Author
-
-Built with ❤️ for research automation
+MIT License

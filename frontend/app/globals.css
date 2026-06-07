@@ -119,12 +119,12 @@ select {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(100, 82, 62, 0.18);
+  background: rgba(100, 82, 62, 0.45);
   border-radius: 999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 82, 62, 0.28);
+  background: rgba(100, 82, 62, 0.65);
 }
 
 .memory-markdown ul,

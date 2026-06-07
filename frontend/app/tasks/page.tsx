@@ -78,8 +78,8 @@ export default function TasksPage() {
               </button>
             ))}
           </div>
-          <Link href="/" className="hidden rounded bg-accent-purple px-4 py-1.5 text-xs font-bold uppercase tracking-wider text-white md:block">
-            New Task
+          <Link href="/" className="rounded bg-[#2b2620] px-4 py-1.5 text-xs font-bold uppercase tracking-wider text-white md:block">
+            New Mission
           </Link>
         </div>
 
