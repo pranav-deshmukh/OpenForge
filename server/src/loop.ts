@@ -31,6 +31,15 @@ const MAX_ITERATIONS_TOOL_MODE = 15;
 const MAX_SUBTASK_RETRIES = 3;
 const CONCURRENT_WORKERS = 2;
 
+const MAX_INITIAL_SUBTASKS = 8;
+const MAX_TOTAL_SUBTASKS = 12;
+const MAX_DAG_DEPTH = 3;
+const MAX_NO_PROGRESS = 5;
+
+const MAX_TOTAL_AGENT_STEPS = 150;
+const MAX_REPLAN_ATTEMPTS = 2;
+const MAX_RETRIES_PER_TASK = 2;
+
 function isTaskCancelled(taskId: string): boolean {
   return getTask(taskId)?.status === 'cancelled';
 }
@@ -111,6 +120,25 @@ function getSubTaskAgentId(subTask: SubTask): AgentId {
 function hasRequiredArtifacts(task: Task, subTask: SubTask): boolean {
   const artifactNames = new Set(getArtifactsForTask(task.id).map((artifact) => artifact.name));
   return subTask.inputArtifacts.every((artifactName) => artifactNames.has(artifactName));
+}
+
+function calculateDagDepth(subTasks: SubTask[]): number {
+  if (subTasks.length === 0) return 0;
+  const memo = new Map<string, number>();
+
+  function getDepth(id: string): number {
+    if (memo.has(id)) return memo.get(id)!;
+    const st = subTasks.find(s => s.id === id);
+    if (!st || !st.dependencies || st.dependencies.length === 0) {
+      memo.set(id, 1);
+      return 1;
+    }
+    const depth = 1 + Math.max(...st.dependencies.map(depId => getDepth(depId)));
+    memo.set(id, depth);
+    return depth;
+  }
+
+  return Math.max(...subTasks.map(st => getDepth(st.id)));
 }
 
 export async function processTask(task: Task): Promise<void> {
@@ -432,7 +460,12 @@ If you need a package NOT in the above list, install it normally. It will persis
 export async function runOrchestrator(task: Task): Promise<void> {
   try {
     console.log(`\n[Orchestrator] Starting: ${task.goal}`);
-    updateTask(task.id, { status: 'running', startedAt: Date.now() });
+    updateTask(task.id, { 
+      status: 'running', 
+      startedAt: Date.now(),
+      replanCount: 0,
+      totalAgentSteps: 0
+    });
     saveMemory(task.id, 'thought', `Starting orchestrated goal: ${task.goal}`, null, 'episodic');
     setAgentPhase('Forge', 'planning', {
       currentTaskId: task.id,
@@ -450,9 +483,19 @@ export async function runOrchestrator(task: Task): Promise<void> {
     const activeSubTasks = new Set<string>();
 
     while (!completed) {
-      if (isTaskCancelled(task.id)) {
+      const currentTask = getTask(task.id)!;
+      if (currentTask.status === 'cancelled') {
         return;
       }
+
+      // Global Budget Check
+      if ((currentTask.totalAgentSteps || 0) >= MAX_TOTAL_AGENT_STEPS) {
+        console.error(`[Orchestrator] Execution terminated: Global budget exceeded (${MAX_TOTAL_AGENT_STEPS} steps).`);
+        saveMemory(task.id, 'error', `Execution terminated: Global budget exceeded (${MAX_TOTAL_AGENT_STEPS} steps).`, null, 'working');
+        completed = true;
+        break;
+      }
+
       incrementTaskIterations(task.id);
       const subTasks = getSubTasksForTask(task.id);
       const unblocked = subTasks.filter(st =>
@@ -470,14 +513,30 @@ export async function runOrchestrator(task: Task): Promise<void> {
           completed = true;
           break;
         }
-        if (subTasks.some(st => st.status === 'failed' && st.retryCount >= MAX_SUBTASK_RETRIES)) {
+
+        // Retry limit check
+        if (subTasks.some(st => st.status === 'failed' && st.retryCount >= MAX_RETRIES_PER_TASK)) {
           console.error('[Orchestrator] Task failed: Some subtasks failed permanently.');
-          updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Some subtasks failed permanently.' });
+          updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Some subtasks failed permanently (retry limit reached).' });
           return;
         }
         
+        if (currentTask.agentMode === 'FAST') {
+          console.log('[Orchestrator] No unblocked tasks in FAST mode. Failing task to prevent over-planning.');
+          updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Stalled: No unblocked tasks available in FAST mode.' });
+          return;
+        }
+
+        // Replan limit check
+        if ((currentTask.replanCount || 0) >= MAX_REPLAN_ATTEMPTS) {
+          console.error(`[Orchestrator] Replanning terminated: Max attempts reached (${MAX_REPLAN_ATTEMPTS}).`);
+          updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: `Maximum replan attempts reached (${MAX_REPLAN_ATTEMPTS}).` });
+          return;
+        }
+
         console.log('[Orchestrator] No unblocked tasks and not all done. Checking for replanning...');
         await reflectAndReplan(task);
+        updateTask(task.id, { replanCount: (currentTask.replanCount || 0) + 1 });
         continue;
       }
 
@@ -529,15 +588,40 @@ export async function runOrchestrator(task: Task): Promise<void> {
       await sleep(2000);
     }
 
-    console.log(`\n[Orchestrator] Goal achieved: ${task.goal}`);
-    const completedSubTasks = getSubTasksForTask(task.id).filter((subTask) => subTask.status === 'done');
+    console.log(`\n[Orchestrator] Execution finished: ${task.goal}`);
+    const finalSubTasks = getSubTasksForTask(task.id);
+    const completedSubTasks = finalSubTasks.filter((st) => st.status === 'done');
+    const failedSubTasks = finalSubTasks.filter((st) => st.status === 'failed');
     const artifactNames = getArtifactsForTask(task.id).map((artifact) => artifact.name);
-    const result = [
-      'Goal completed successfully.',
-      completedSubTasks.length > 0 ? `Completed subtasks: ${completedSubTasks.map((subTask) => subTask.title).join(', ')}` : '',
+    
+    const finalTask = getTask(task.id)!;
+    const metrics = {
+      initialSubtaskCount: finalTask.metrics?.initialSubtaskCount || 0,
+      totalSubtaskCount: finalSubTasks.length,
+      tasksCompleted: completedSubTasks.length,
+      tasksFailed: failedSubTasks.length,
+      replanCount: finalTask.replanCount || 0,
+      averageTaskIterations: finalSubTasks.length > 0 
+        ? Math.round(finalSubTasks.reduce((acc, st) => acc + (st.retryCount * MAX_ITERATIONS_PER_SUBTASK), 0) / finalSubTasks.length) // Rough estimate
+        : 0
+    };
+
+    const summary = [
+      finalTask.status === 'done' ? 'Goal achieved.' : 'Execution finished.',
+      `Completed milestones: ${completedSubTasks.length}/${finalSubTasks.length}`,
+      `Total Agent Steps: ${finalTask.totalAgentSteps}/${MAX_TOTAL_AGENT_STEPS}`,
+      `Replans: ${finalTask.replanCount}/${MAX_REPLAN_ATTEMPTS}`,
       artifactNames.length > 0 ? `Artifacts: ${artifactNames.join(', ')}` : '',
     ].filter(Boolean).join('\n');
-    updateTask(task.id, { status: 'done', completedAt: Date.now(), result });
+
+    updateTask(task.id, { 
+      status: finalTask.status === 'failed' ? 'failed' : 'done', 
+      completedAt: Date.now(), 
+      result: summary,
+      metrics 
+    });
+    
+    saveMemory(task.id, 'thought', `Execution Summary:\n${summary}\n\nMetrics: ${JSON.stringify(metrics, null, 2)}`, null, 'episodic');
     clearAgentAssignment('Forge');
   } catch (err: any) {
     if (err.message === 'Task cancelled by user' || isTaskCancelled(task.id)) {
@@ -584,11 +668,17 @@ async function dispatchWorker(task: Task, subTask: SubTask) {
   if (updatedSubTask && updatedSubTask.status === 'done') {
     const passed = await verifySubTask(task, updatedSubTask);
     if (passed) {
-      // Critique Phase
-      const criticPassed = await runCriticLoop(task, updatedSubTask);
-      if (!criticPassed) {
-        console.log(`[Orchestrator] Critique failed for: ${subTask.title}`);
-        await handleSubTaskFailure(task, updatedSubTask, 'critique');
+      // FAST mode skips critique phase
+      if (task.agentMode === 'RESEARCH') {
+        // Critique Phase
+        const criticPassed = await runCriticLoop(task, updatedSubTask);
+        if (!criticPassed) {
+          console.log(`[Orchestrator] Critique failed for: ${subTask.title}`);
+          await handleSubTaskFailure(task, updatedSubTask, 'critique');
+        }
+      } else {
+        // In FAST mode, just mark as done if verification passed
+        updateSubTask(subTask.id, { status: 'done' });
       }
     } else {
       console.log(`[Orchestrator] Verification failed for: ${subTask.title}`);
@@ -622,6 +712,11 @@ async function planTask(task: Task) {
   
   try {
     const plan = JSON.parse(cleanJsonResponse(response));
+
+    if (plan.subTasks.length > MAX_INITIAL_SUBTASKS) {
+      throw new Error(`Planner attempted to create ${plan.subTasks.length} subtasks, which exceeds the limit of ${MAX_INITIAL_SUBTASKS}.`);
+    }
+
     updateTask(task.id, { 
       globalContext: plan.globalContext,
       successCriteria: plan.successCriteria
@@ -646,6 +741,18 @@ async function planTask(task: Task) {
         lockedPaths: st.lockedPaths || [],
       }),
     );
+
+    updateTask(task.id, {
+      metrics: {
+        initialSubtaskCount: createdSubTasks.length,
+        totalSubtaskCount: createdSubTasks.length,
+        tasksCompleted: 0,
+        tasksFailed: 0,
+        replanCount: 0,
+        averageTaskIterations: 0
+      }
+    });
+
     const titleToId = new Map<string, string>(
       createdSubTasks.map((createdSubTask: SubTask) => [createdSubTask.title, createdSubTask.id]),
     );
@@ -820,6 +927,8 @@ If you need a package NOT in the above list, install it normally. It will persis
   ];
 
   let lastProcessedInputTime = subTask.createdAt - 1;
+  let consecutiveNoProgress = 0;
+  let lastState = { thought: '', toolName: '', toolArgs: '' };
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
     if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
@@ -827,6 +936,12 @@ If you need a package NOT in the above list, install it normally. It will persis
       return;
     }
     incrementTaskIterations(task.id);
+    
+    // Update global step count
+    const currentTask = getTask(task.id);
+    if (currentTask) {
+      updateTask(task.id, { totalAgentSteps: (currentTask.totalAgentSteps || 0) + 1 });
+    }
 
     // Check for user input
     const newInputs = getMemoryForSubTask(subTask.id).filter(
@@ -850,6 +965,30 @@ If you need a package NOT in the above list, install it normally. It will persis
     }
 
     const { thought, toolCall } = response;
+
+    // Progress detection
+    const currentState = { 
+      thought: thought || '', 
+      toolName: toolCall?.name || '', 
+      toolArgs: JSON.stringify(toolCall?.args || {}) 
+    };
+    
+    if (currentState.thought === lastState.thought && 
+        currentState.toolName === lastState.toolName && 
+        currentState.toolArgs === lastState.toolArgs) {
+      consecutiveNoProgress++;
+    } else {
+      consecutiveNoProgress = 0;
+    }
+    lastState = currentState;
+
+    if (consecutiveNoProgress >= MAX_NO_PROGRESS) {
+      const msg = `Subtask failed: No meaningful progress for ${MAX_NO_PROGRESS} iterations. Stalled at: ${currentState.thought.slice(0, 100)}`;
+      saveMemory(task.id, 'error', msg, subTask.id, 'working');
+      updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Stalled: No progress detected' });
+      clearAgentAssignment(assignedAgent);
+      return;
+    }
 
     if (thought) {
       saveMemory(task.id, 'thought', `[${subTask.title}] ${thought}`, subTask.id, 'working');
@@ -1101,27 +1240,33 @@ async function handleSubTaskFailure(task: Task, subTask: SubTask, phase: string)
   if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
     return;
   }
-  console.log(`[Reflection] Analyzing ${phase} failure for: ${subTask.title}`);
-  setAgentPhase('Echo', 'reflecting', {
-    currentTaskId: task.id,
-    currentTaskGoal: task.goal,
-    currentSubTaskId: subTask.id,
-    currentSubTaskTitle: subTask.title,
-    note: `Analyzing ${phase} failure`,
-  });
-  const systemPrompt = getSystemPrompt('reflection', { task, subTask });
-  const response = await callLLM(systemPrompt, `Analyze why ${subTask.title} failed in ${phase} phase.`);
-  
-  let result: any;
-  try {
-    result = JSON.parse(cleanJsonResponse(response));
-  } catch {
-    saveMemory(task.id, 'error', `Reflection failed to output JSON: ${response}`, subTask.id, 'working');
-    return;
-  }
 
-  createReflection(subTask.id, result.thought || response);
-  saveMemory(task.id, 'thought', `[Reflection] ${subTask.title} analysis: ${result.thought || ''}`, subTask.id, 'episodic');
+  if (task.agentMode === 'FAST') {
+    console.log(`[Orchestrator] Failure in FAST mode for: ${subTask.title}. Skipping reflection.`);
+  } else {
+    console.log(`[Reflection] Analyzing ${phase} failure for: ${subTask.title}`);
+    setAgentPhase('Echo', 'reflecting', {
+      currentTaskId: task.id,
+      currentTaskGoal: task.goal,
+      currentSubTaskId: subTask.id,
+      currentSubTaskTitle: subTask.title,
+      note: `Analyzing ${phase} failure`,
+    });
+    const systemPrompt = getSystemPrompt('reflection', { task, subTask });
+    const response = await callLLM(systemPrompt, `Analyze why ${subTask.title} failed in ${phase} phase.`);
+    
+    let result: any;
+    try {
+      result = JSON.parse(cleanJsonResponse(response));
+    } catch {
+      saveMemory(task.id, 'error', `Reflection failed to output JSON: ${response}`, subTask.id, 'working');
+      return;
+    }
+
+    createReflection(subTask.id, result.thought || response);
+    saveMemory(task.id, 'thought', `[Reflection] ${subTask.title} analysis: ${result.thought || ''}`, subTask.id, 'episodic');
+    clearAgentAssignment('Echo');
+  }
 
   if (subTask.retryCount < MAX_SUBTASK_RETRIES) {
     updateSubTask(subTask.id, { 
@@ -1156,6 +1301,11 @@ async function reflectAndReplan(task: Task) {
   try {
     const plan = JSON.parse(cleanJsonResponse(response));
     const newSubTasks = plan.subTasks.filter((st: any) => !subTasks.find((existing) => existing.title === st.title));
+    
+    if (subTasks.length + newSubTasks.length > MAX_TOTAL_SUBTASKS) {
+      throw new Error(`Replanning would exceed MAX_TOTAL_SUBTASKS (${MAX_TOTAL_SUBTASKS}). Current: ${subTasks.length}, New: ${newSubTasks.length}`);
+    }
+
     const created: SubTask[] = newSubTasks.map((st: any) =>
       createSubTask({
           taskId: task.id,
@@ -1180,9 +1330,18 @@ async function reflectAndReplan(task: Task) {
         dependencies: dependencyIdsFromTitles(newSubTasks[index].dependencies || [], titleToId),
       });
     }
+
+    // Depth check after linking
+    const allSubTasks = getSubTasksForTask(task.id);
+    const currentDepth = calculateDagDepth(allSubTasks);
+    if (currentDepth > MAX_DAG_DEPTH) {
+      throw new Error(`Replanning exceeded MAX_DAG_DEPTH (${MAX_DAG_DEPTH}). Current depth: ${currentDepth}`);
+    }
+
     clearAgentAssignment('Atlas');
-  } catch (err) {
-    console.error('[Orchestrator] Replanning failed to parse:', err);
+  } catch (err: any) {
+    console.error('[Orchestrator] Replanning failed:', err.message);
+    saveMemory(task.id, 'error', `Replanning failed: ${err.message}`, null, 'working');
     clearAgentAssignment('Atlas');
   }
 }

@@ -2,6 +2,8 @@ export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
 
 export type TaskMode = 'chat' | 'tool' | 'autonomous_dag';
 
+export type AgentMode = 'FAST' | 'RESEARCH';
+
 export type AgentId =
   | 'Forge'
   | 'Atlas'
@@ -71,8 +73,19 @@ export interface Task {
   result?: string;
   error?: string;
   iterations?: number;
+  agentMode?: AgentMode;
   globalContext?: string;
   successCriteria?: string[];
+  replanCount?: number;
+  totalAgentSteps?: number;
+  metrics?: {
+    initialSubtaskCount: number;
+    totalSubtaskCount: number;
+    tasksCompleted: number;
+    tasksFailed: number;
+    replanCount: number;
+    averageTaskIterations: number;
+  };
 }
 
 export type SubTaskStatus = 

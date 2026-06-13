@@ -31,8 +31,12 @@ db.exec(`
     result TEXT,
     error TEXT,
     iterations INTEGER DEFAULT 0,
+    replanCount INTEGER DEFAULT 0,
+    totalAgentSteps INTEGER DEFAULT 0,
+    agentMode TEXT,
     globalContext TEXT,
-    successCriteria TEXT
+    successCriteria TEXT,
+    metrics TEXT
   );
 
   CREATE TABLE IF NOT EXISTS subtasks (
@@ -99,6 +103,15 @@ try {
   db.exec(`ALTER TABLE tasks ADD COLUMN iterations INTEGER DEFAULT 0`);
 } catch {}
 try {
+  db.exec(`ALTER TABLE tasks ADD COLUMN replanCount INTEGER DEFAULT 0`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE tasks ADD COLUMN totalAgentSteps INTEGER DEFAULT 0`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE tasks ADD COLUMN agentMode TEXT`);
+} catch {}
+try {
   db.exec(`ALTER TABLE tasks ADD COLUMN globalContext TEXT`);
 } catch {}
 try {
@@ -108,7 +121,13 @@ try {
   db.exec(`ALTER TABLE tasks ADD COLUMN mode TEXT`);
 } catch {}
 try {
+  db.exec(`ALTER TABLE tasks ADD COLUMN metrics TEXT`);
+} catch {}
+try {
   db.exec(`ALTER TABLE subtasks ADD COLUMN critique TEXT`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE subtasks ADD COLUMN retryCount INTEGER DEFAULT 0`);
 } catch {}
 try {
   db.exec(`ALTER TABLE subtasks ADD COLUMN workspaceScope TEXT NOT NULL DEFAULT '[]'`);
@@ -161,19 +180,24 @@ function fromDbTask(row: any): Task {
   return {
     ...row,
     successCriteria: row.successCriteria ? JSON.parse(row.successCriteria) : undefined,
+    metrics: row.metrics ? JSON.parse(row.metrics) : undefined,
   };
 }
 
 function toDbTask(task: Task): any {
   return {
     mode: null,
+    agentMode: 'FAST',
     globalContext: null,
     startedAt: null,
     completedAt: null,
     result: null,
     error: null,
+    replanCount: 0,
+    totalAgentSteps: 0,
     ...task,
     successCriteria: task.successCriteria ? JSON.stringify(task.successCriteria) : null,
+    metrics: task.metrics ? JSON.stringify(task.metrics) : null,
   };
 }
 
@@ -185,11 +209,20 @@ export function createTask(goal: string): Task {
     status: 'pending',
     createdAt: Date.now(),
     iterations: 0,
+    replanCount: 0,
+    totalAgentSteps: 0,
+    agentMode: 'FAST',
   };
   const dbTask = toDbTask(task);
   db.prepare(`
-    INSERT INTO tasks (id, goal, status, mode, createdAt, iterations, globalContext, successCriteria)
-    VALUES (@id, @goal, @status, @mode, @createdAt, @iterations, @globalContext, @successCriteria)
+    INSERT INTO tasks (
+      id, goal, status, mode, agentMode, createdAt, iterations, 
+      replanCount, totalAgentSteps, globalContext, successCriteria, metrics
+    )
+    VALUES (
+      @id, @goal, @status, @mode, @agentMode, @createdAt, @iterations, 
+      @replanCount, @totalAgentSteps, @globalContext, @successCriteria, @metrics
+    )
   `).run(dbTask);
   if (ioInstance) {
     ioInstance.emit('task:update', task);
@@ -323,7 +356,7 @@ export function getAllSubTasks(): SubTask[] {
   return db.prepare('SELECT * FROM subtasks ORDER BY createdAt ASC').all().map(fromDbSubTask);
 }
 
-// Reflections
+
 export function createReflection(subTaskId: string, content: string): Reflection {
   const reflection: Reflection = {
     id: uuid(),
