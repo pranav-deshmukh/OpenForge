@@ -2,9 +2,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "@/lib/api";
-import { SystemStatus } from "@/lib/types";
+import { SystemStatus, Task } from "@/lib/types";
+import { relativeTime } from "@/lib/time";
 
 type NavItem = {
   href: string;
@@ -51,6 +52,8 @@ const navSections: NavSection[] = [
     label: "Configuration",
     items: [
       { href: "/skills", label: "Coding", icon: <IconFrame>{"</>"}</IconFrame> },
+      { href: "/github", label: "GitHub", icon: <IconFrame>#</IconFrame> },
+      { href: "/mail", label: "Agent Mail", icon: <IconFrame>@</IconFrame> },
     ],
   },
 ];
@@ -58,6 +61,27 @@ const navSections: NavSection[] = [
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [system, setSystem] = useState<SystemStatus | null>(null);
+  const [notifications, setNotifications] = useState<TaskNotification[]>([]);
+  const [isNotificationOpen, setIsNotificationOpen] = useState(false);
+  const knownCompletedTaskIdsRef = useRef<Set<string>>(new Set());
+  const notificationsInitializedRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(TASK_NOTIFICATIONS_KEY);
+      if (!stored) return;
+      const parsed = JSON.parse(stored) as TaskNotification[];
+      if (Array.isArray(parsed)) {
+        setNotifications(parsed);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(TASK_NOTIFICATIONS_KEY, JSON.stringify(notifications));
+    } catch {}
+  }, [notifications]);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,16 +107,92 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const syncTaskNotifications = async () => {
+      try {
+        const tasks = await api.getTasks();
+        if (cancelled) return;
+        setNotifications((current) => mergeTaskNotifications(current, tasks, knownCompletedTaskIdsRef, notificationsInitializedRef));
+      } catch {}
+    };
+
+    void syncTaskNotifications();
+    const interval = window.setInterval(syncTaskNotifications, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
   const failedCount = (system?.tasks.failed ?? 0) + (system?.tasks.cancelled ?? 0);
+  const unreadCount = notifications.filter((notification) => !notification.read).length;
+  const recentNotifications = useMemo(() => notifications.slice(0, 8), [notifications]);
 
   return (
     <div className="h-screen overflow-hidden">
       <div className="mx-auto flex h-full max-w-[1600px]">
         <aside className="glass-panel hidden w-[184px] shrink-0 overflow-y-auto border-r border-bg-border px-5 py-7 md:block">
-          <Link href="/agents" className="mb-10 flex items-center gap-2">
-            <span className="font-display text-[2rem] leading-none tracking-tight">Forge</span>
-            <span className="mt-2 h-2.5 w-2.5 rounded-full bg-accent-gold" />
-          </Link>
+          <div className="mb-10 flex items-center justify-between gap-3">
+            <Link href="/agents" className="flex items-center gap-2">
+              <span className="font-display text-[2rem] leading-none tracking-tight">Forge</span>
+              <span className="mt-2 h-2.5 w-2.5 rounded-full bg-accent-gold" />
+            </Link>
+            <div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsNotificationOpen((current) => !current);
+                  setNotifications((current) => current.map((notification) => ({ ...notification, read: true })));
+                }}
+                className="relative flex h-10 w-10 items-center justify-center rounded-full border border-bg-border bg-bg-surface text-text-secondary transition hover:text-text-primary"
+                aria-label="Open notifications"
+              >
+                <span className="text-base">◔</span>
+                {unreadCount > 0 ? (
+                  <span className="absolute -right-1 -top-1 min-w-[18px] rounded-full bg-[#cb5f51] px-1.5 py-0.5 text-center text-[10px] font-bold leading-none text-white">
+                    {unreadCount}
+                  </span>
+                ) : null}
+              </button>
+            </div>
+          </div>
+
+          {isNotificationOpen ? (
+            <div className="mb-6 rounded-3xl border border-bg-border bg-bg-surface p-4 shadow-soft">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-text-primary">Notifications</div>
+                <span className="text-[10px] uppercase tracking-[0.22em] text-text-dim">
+                  {unreadCount > 0 ? `${unreadCount} new` : "all caught up"}
+                </span>
+              </div>
+              <div className="space-y-2">
+                {recentNotifications.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-bg-border px-4 py-6 text-sm text-text-dim">
+                    Completed tasks will appear here.
+                  </div>
+                ) : (
+                  recentNotifications.map((notification) => (
+                    <Link
+                      key={notification.id}
+                      href="/tasks"
+                      onClick={() => setIsNotificationOpen(false)}
+                      className="block rounded-2xl border border-bg-border bg-bg-base px-4 py-3 transition hover:border-text-dim"
+                    >
+                      <div className="mb-1 text-xs uppercase tracking-[0.18em] text-emerald-600">
+                        Task completed
+                      </div>
+                      <div className="line-clamp-3 text-sm text-text-primary">{notification.goal}</div>
+                      <div className="mt-2 text-xs text-text-dim">
+                        {relativeTime(notification.completedAt)}
+                      </div>
+                    </Link>
+                  ))
+                )}
+              </div>
+            </div>
+          ) : null}
 
           <nav className="space-y-8">
             {navSections.map((section) => (
@@ -157,4 +257,51 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </button>
     </div>
   );
+}
+
+type TaskNotification = {
+  id: string;
+  goal: string;
+  completedAt: number;
+  read: boolean;
+};
+
+const TASK_NOTIFICATIONS_KEY = "forge.task-notifications";
+
+function mergeTaskNotifications(
+  current: TaskNotification[],
+  tasks: Task[],
+  knownCompletedTaskIdsRef: React.MutableRefObject<Set<string>>,
+  notificationsInitializedRef: React.MutableRefObject<boolean>,
+): TaskNotification[] {
+  const currentIds = new Set(current.map((notification) => notification.id));
+  const completedTasks = tasks.filter((task) => task.status === "done" && task.completedAt);
+
+  if (!notificationsInitializedRef.current) {
+    for (const task of completedTasks) {
+      knownCompletedTaskIdsRef.current.add(task.id);
+    }
+    notificationsInitializedRef.current = true;
+    return current;
+  }
+
+  const additions: TaskNotification[] = [];
+  for (const task of completedTasks) {
+    if (knownCompletedTaskIdsRef.current.has(task.id) || currentIds.has(task.id) || !task.completedAt) {
+      continue;
+    }
+    knownCompletedTaskIdsRef.current.add(task.id);
+    additions.unshift({
+      id: task.id,
+      goal: task.goal,
+      completedAt: task.completedAt,
+      read: false,
+    });
+  }
+
+  if (additions.length === 0) {
+    return current;
+  }
+
+  return [...additions, ...current].slice(0, 20);
 }

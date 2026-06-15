@@ -196,3 +196,38 @@ export interface SystemStatus {
   timestamp: number;
 }
 
+export interface AgentMailConfig {
+  email: string;
+  clientId: string;
+  displayName?: string;
+  ownerEmail?: string;
+  signature?: string;
+  hasClientSecret: boolean;
+  hasRefreshToken: boolean;
+  hasAccessToken: boolean;
+  updatedAt?: number;
+}
+
+export interface GithubAuthConfig {
+  username?: string;
+  email?: string;
+  hasToken: boolean;
+  updatedAt?: number;
+}
+
+export interface GithubRuntimeHealth {
+  checkedAt: number;
+  containerStatus: "running" | "stopped" | "missing";
+  secretsMountPresent: boolean;
+  serverHasToken: boolean;
+  serverUsername?: string;
+  serverEmail?: string;
+  ghInstalled: boolean;
+  ghAuthReady: boolean;
+  ghTokenVisible: boolean;
+  gitUserName?: string;
+  gitUserEmail?: string;
+  gitIdentityReady: boolean;
+  notes: string[];
+}
+

@@ -18,6 +18,8 @@ out/
 # Temporary & cache directories
 .sandbox-tmp/
 .docker-tmp/
+.runtime-secrets/
+server/.runtime-secrets/
 .cache/
 .parcel-cache/
 workspace/

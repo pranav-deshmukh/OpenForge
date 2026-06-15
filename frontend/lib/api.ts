@@ -1,4 +1,4 @@
-import { AgentActivitySnapshot, AgentSnapshot, Artifact, MemoryEntry, SubTask, SystemStatus, Task } from "./types";
+import { AgentActivitySnapshot, AgentMailConfig, AgentSnapshot, Artifact, GithubAuthConfig, GithubRuntimeHealth, MemoryEntry, SubTask, SystemStatus, Task } from "./types";
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
 export const SOCKET_BASE = process.env.NEXT_PUBLIC_SOCKET_BASE_URL ?? API_BASE;
@@ -70,6 +70,47 @@ export function createSkill(name: string, description: string, instructions: str
     method: "POST",
     body: JSON.stringify({ name, description, instructions }),
   });
+}
+
+export function getAgentMailConfig(): Promise<AgentMailConfig | null> {
+  return request<AgentMailConfig | null>("/agent-mail");
+}
+
+export function saveAgentMailConfig(payload: {
+  email: string;
+  clientId: string;
+  clientSecret?: string;
+  refreshToken?: string;
+  accessToken?: string;
+  authorizationCode?: string;
+  redirectUri?: string;
+  displayName?: string;
+  ownerEmail?: string;
+  signature?: string;
+}): Promise<AgentMailConfig> {
+  return request<AgentMailConfig>("/agent-mail", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getGithubAuthConfig(): Promise<GithubAuthConfig | null> {
+  return request<GithubAuthConfig | null>("/github-auth");
+}
+
+export function saveGithubAuthConfig(payload: {
+  token?: string;
+  username?: string;
+  email?: string;
+}): Promise<GithubAuthConfig> {
+  return request<GithubAuthConfig>("/github-auth", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getGithubRuntimeHealth(): Promise<GithubRuntimeHealth> {
+  return request<GithubRuntimeHealth>("/github-auth/health");
 }
 
 export function createResearchTask(goal: string): Promise<Task> {

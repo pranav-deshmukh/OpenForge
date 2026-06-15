@@ -1,5 +1,14 @@
 import { spawn } from 'child_process';
 import { mkdirSync, writeFileSync } from 'fs';
+import fs from 'fs/promises';
+import path from 'path';
+import { readGithubAuthConfig } from './github-auth.js';
+import {
+  ensureRuntimeSecretsDir,
+  getContainerAgentMailPath,
+  getContainerGithubEnvPath,
+  getRuntimeSecretsDir,
+} from './runtime-secrets.js';
 
 const CONTAINER_NAME = 'phd-agent-workspace';
 const WORKSPACE_IMAGE = 'phd-agent-workspace:latest';
@@ -16,13 +25,18 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function withRuntimeEnv(command: string): string {
+  const envPath = shellQuote(getContainerGithubEnvPath());
+  return `if [ -f ${envPath} ]; then . ${envPath}; fi; ${command}`;
+}
+
 export async function execInContainer(
   command: string,
   timeoutMs = 60000
 ): Promise<ShellResult> {
   return new Promise((resolve) => {
     const proc = spawn('docker', [
-      'exec', '-i', CONTAINER_NAME, 'bash', '-c', command
+      'exec', '-i', CONTAINER_NAME, 'bash', '-lc', withRuntimeEnv(command)
     ]);
 
     let stdout = '';
@@ -65,6 +79,13 @@ export async function execInContainer(
 export async function ensureWorkspaceReady(): Promise<void> {
   // 1. Check if container exists and its status
   try {
+    if (!(await containerHasSecretsMount())) {
+      console.log('[Shell] Workspace container missing /run/openforge mount. Recreating...');
+      await execDockerCommand(['rm', '-f', CONTAINER_NAME]);
+      await startContainer();
+      return;
+    }
+
     const result = await execDockerCommand([
       'inspect', '-f', '{{.State.Status}}', CONTAINER_NAME
     ]);
@@ -165,9 +186,13 @@ async function startContainer(): Promise<void> {
 
   const skillsPath = process.cwd() + '/skills';
   const workspacePath = process.cwd() + '/workspace';
+  const runtimeSecretsPath = getRuntimeSecretsDir();
 
   mkdirSync(workspacePath, { recursive: true });
   mkdirSync(skillsPath, { recursive: true });
+  mkdirSync(runtimeSecretsPath, { recursive: true });
+  await ensureRuntimeSecretsDir();
+  await writeRuntimeEnvFile();
 
   await execDockerCommand([
     'run', '-d',
@@ -176,6 +201,7 @@ async function startContainer(): Promise<void> {
     '--cpus=1',
     '-v', `${skillsPath}:/skills`,
     '-v', `${workspacePath}:/workspace`,
+    '-v', `${runtimeSecretsPath}:/run/openforge`,
     '-v', `openforge-npm-global:/usr/local/share/npm-global`,
     '-v', `openforge-pip-packages:/usr/local/lib/python3`,
     '-v', `openforge-root-cache:/root/.cache`,
@@ -186,6 +212,7 @@ async function startContainer(): Promise<void> {
     WORKSPACE_IMAGE,
   ]);
 
+  await applyGitIdentityInContainer();
   console.log(`[Shell] Workspace container started`);
 }
 
@@ -305,6 +332,157 @@ export async function readFileFromContainer(
   filePath: string,
 ): Promise<ShellResult> {
   return execInContainer(`cat ${shellQuote(filePath)}`);
+}
+
+async function containerHasSecretsMount(): Promise<boolean> {
+  try {
+    const result = await execDockerCommand([
+      'inspect',
+      '-f',
+      '{{range .Mounts}}{{println .Destination}}{{end}}',
+      CONTAINER_NAME,
+    ]);
+    return result.stdout.split(/\r?\n/).some((line) => line.trim() === '/run/openforge');
+  } catch {
+    return false;
+  }
+}
+
+async function writeRuntimeEnvFile(): Promise<void> {
+  const githubAuth = await readGithubAuthConfig();
+  const envPath = path.join(getRuntimeSecretsDir(), 'env.sh');
+  const lines = [
+    'export OPENFORGE_RUNTIME_SECRETS_DIR=/run/openforge',
+    `export OPENFORGE_AGENT_MAIL_PATH=${shellQuote(getContainerAgentMailPath())}`,
+  ];
+
+  if (githubAuth?.token) {
+    lines.push(`export GH_TOKEN=${shellQuote(githubAuth.token)}`);
+  }
+  if (githubAuth?.username) {
+    lines.push(`export GIT_AUTHOR_NAME=${shellQuote(githubAuth.username)}`);
+    lines.push(`export GIT_COMMITTER_NAME=${shellQuote(githubAuth.username)}`);
+  }
+  if (githubAuth?.email) {
+    lines.push(`export GIT_AUTHOR_EMAIL=${shellQuote(githubAuth.email)}`);
+    lines.push(`export GIT_COMMITTER_EMAIL=${shellQuote(githubAuth.email)}`);
+  }
+
+  await ensureRuntimeSecretsDir();
+  await fs.writeFile(envPath, `${lines.join('\n')}\n`, 'utf-8');
+}
+
+async function applyGitIdentityInContainer(): Promise<void> {
+  const githubAuth = await readGithubAuthConfig();
+  if (!githubAuth?.username || !githubAuth.email) {
+    return;
+  }
+
+  await execInContainer(
+    `git config --global user.name ${shellQuote(githubAuth.username)} && ` +
+      `git config --global user.email ${shellQuote(githubAuth.email)}`,
+  );
+}
+
+export async function syncRuntimeSecretsToContainer(): Promise<void> {
+  await writeRuntimeEnvFile();
+
+  const status = await getWorkspaceStatus();
+  if (status.status !== 'running') {
+    return;
+  }
+
+  if (!(await containerHasSecretsMount())) {
+    await execDockerCommand(['rm', '-f', CONTAINER_NAME]);
+    await startContainer();
+    return;
+  }
+
+  await applyGitIdentityInContainer();
+}
+
+export interface GithubRuntimeHealth {
+  checkedAt: number;
+  containerStatus: 'running' | 'stopped' | 'missing';
+  secretsMountPresent: boolean;
+  serverHasToken: boolean;
+  serverUsername?: string;
+  serverEmail?: string;
+  ghInstalled: boolean;
+  ghAuthReady: boolean;
+  ghTokenVisible: boolean;
+  gitUserName?: string;
+  gitUserEmail?: string;
+  gitIdentityReady: boolean;
+  notes: string[];
+}
+
+export async function getGithubRuntimeHealth(): Promise<GithubRuntimeHealth> {
+  const githubAuth = await readGithubAuthConfig();
+  const workspaceStatus = await getWorkspaceStatus();
+  const secretsMountPresent =
+    workspaceStatus.status === 'running' ? await containerHasSecretsMount() : false;
+
+  const health: GithubRuntimeHealth = {
+    checkedAt: Date.now(),
+    containerStatus: workspaceStatus.status,
+    secretsMountPresent,
+    serverHasToken: Boolean(githubAuth?.token),
+    serverUsername: githubAuth?.username,
+    serverEmail: githubAuth?.email,
+    ghInstalled: false,
+    ghAuthReady: false,
+    ghTokenVisible: false,
+    gitUserName: undefined,
+    gitUserEmail: undefined,
+    gitIdentityReady: false,
+    notes: [],
+  };
+
+  if (workspaceStatus.status !== 'running') {
+    health.notes.push('Workspace container is not running.');
+    return health;
+  }
+
+  if (!secretsMountPresent) {
+    health.notes.push('Workspace container is missing the /run/openforge secret mount.');
+    return health;
+  }
+
+  const ghCheck = await execInContainer('command -v gh >/dev/null 2>&1 && echo installed || echo missing');
+  health.ghInstalled = ghCheck.stdout.trim() === 'installed';
+  if (!health.ghInstalled) {
+    health.notes.push('GitHub CLI is not installed in the container.');
+  }
+
+  const tokenCheck = await execInContainer('[ -n "$GH_TOKEN" ] && echo present || echo missing');
+  health.ghTokenVisible = tokenCheck.stdout.trim() === 'present';
+  if (!health.ghTokenVisible) {
+    health.notes.push('GH_TOKEN is not visible inside the container runtime.');
+  }
+
+  const gitName = await execInContainer('git config --global --get user.name || true');
+  const gitEmail = await execInContainer('git config --global --get user.email || true');
+  health.gitUserName = gitName.stdout.trim() || undefined;
+  health.gitUserEmail = gitEmail.stdout.trim() || undefined;
+  health.gitIdentityReady = Boolean(health.gitUserName && health.gitUserEmail);
+  if (!health.gitIdentityReady) {
+    health.notes.push('Global git user.name or user.email is missing inside the container.');
+  }
+
+  if (health.ghInstalled) {
+    const authCheck = await execInContainer('gh auth status >/dev/null 2>&1 && echo ok || echo missing');
+    health.ghAuthReady = authCheck.stdout.trim() === 'ok';
+    if (!health.ghAuthReady) {
+      health.notes.push('gh auth status is failing inside the container.');
+    }
+  }
+
+  if (health.notes.length === 0) {
+    health.notes.push('GitHub runtime is ready.');
+  }
+
+  return health;
 }
 
 export async function pathExistsInContainer(filePath: string): Promise<boolean> {

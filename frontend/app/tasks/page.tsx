@@ -16,18 +16,22 @@ export default function TasksPage() {
   const [expandedSubTasks, setExpandedSubTasks] = useState<SubTask[]>([]);
   const [expandedArtifacts, setExpandedArtifacts] = useState<Artifact[]>([]);
   const [expandedMemory, setExpandedMemory] = useState<MemoryEntry[]>([]);
+  const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null);
 
   useEffect(() => {
-    const fetchTasks = async () => {
-      try {
-        const fetched = await api.getTasks();
-        setTasks(fetched || []);
-      } catch (err) {}
-    };
-    fetchTasks();
-    const interval = setInterval(fetchTasks, 3000);
+    void refreshTasks();
+    const interval = setInterval(() => {
+      void refreshTasks();
+    }, 3000);
     return () => clearInterval(interval);
   }, []);
+
+  const refreshTasks = async () => {
+    try {
+      const fetched = await api.getTasks();
+      setTasks(fetched || []);
+    } catch {}
+  };
 
   const handleExpand = async (taskId: string) => {
     if (expandedId === taskId) {
@@ -42,12 +46,36 @@ export default function TasksPage() {
       const [subTasks, artifacts, memory] = await Promise.all([
         api.getSubTasks(taskId),
         api.getArtifacts(taskId),
-        api.getTaskMemory(taskId)
+        api.getTaskMemory(taskId),
       ]);
       setExpandedSubTasks(subTasks || []);
       setExpandedArtifacts(artifacts || []);
       setExpandedMemory(memory || []);
-    } catch (err) {}
+    } catch {}
+  };
+
+  const handleCancelTask = async (taskId: string) => {
+    if (cancellingTaskId) return;
+
+    setCancellingTaskId(taskId);
+    try {
+      await api.cancelTask(taskId);
+      await refreshTasks();
+      if (expandedId === taskId) {
+        const [subTasks, artifacts, memory] = await Promise.all([
+          api.getSubTasks(taskId),
+          api.getArtifacts(taskId),
+          api.getTaskMemory(taskId),
+        ]);
+        setExpandedSubTasks(subTasks || []);
+        setExpandedArtifacts(artifacts || []);
+        setExpandedMemory(memory || []);
+      }
+    } catch {
+      alert("Failed to cancel task.");
+    } finally {
+      setCancellingTaskId(null);
+    }
   };
 
   const filteredTasks = tasks.filter(t => {
@@ -85,12 +113,13 @@ export default function TasksPage() {
 
         <div className="flex-1 w-full overflow-x-auto relative">
           <div className="min-w-[800px]">
-            <div className="grid grid-cols-[120px_4fr_100px_120px_100px] gap-4 py-3 px-4 text-[10px] uppercase font-mono tracking-widest text-text-dim border-b border-bg-border">
+            <div className="grid grid-cols-[120px_4fr_100px_120px_100px_110px] gap-4 py-3 px-4 text-[10px] uppercase font-mono tracking-widest text-text-dim border-b border-bg-border">
               <div>STATUS</div>
               <div>GOAL</div>
               <div>ITERATIONS</div>
               <div>STARTED</div>
               <div>DURATION</div>
+              <div className="text-right">ACTION</div>
             </div>
 
             <div className="flex flex-col text-sm font-sans">
@@ -110,7 +139,7 @@ export default function TasksPage() {
                 return (
                   <div key={task.id} className="flex flex-col border-b border-bg-border cursor-pointer group hover:bg-bg-surface transition-colors">
                     <div 
-                      className="grid grid-cols-[120px_4fr_100px_120px_100px] gap-4 py-4 px-4 items-center"
+                      className="grid grid-cols-[120px_4fr_100px_120px_100px_110px] gap-4 py-4 px-4 items-center"
                       onClick={() => handleExpand(task.id)}
                     >
                       <div>
@@ -120,10 +149,41 @@ export default function TasksPage() {
                       <div className="font-mono text-text-secondary text-xs">{task.iterations || 0} steps</div>
                       <div className="font-mono text-text-secondary text-xs">{createdAt.toLocaleTimeString()}</div>
                       <div className="font-mono text-text-secondary text-xs">{dur}</div>
+                      <div className="flex justify-end">
+                        {task.status === "pending" || task.status === "running" ? (
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleCancelTask(task.id);
+                            }}
+                            disabled={cancellingTaskId === task.id}
+                            className="rounded-full border border-rose-400/30 bg-rose-500/10 px-3 py-1 text-[10px] font-mono uppercase tracking-[0.18em] text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {cancellingTaskId === task.id ? "Cancelling" : "Cancel"}
+                          </button>
+                        ) : (
+                          <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-text-dim">
+                            {task.status === "cancelled" ? "Cancelled" : "Closed"}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     
                     {isExpanded && (
                       <div className="px-4 pb-6 w-full animate-in fade-in slide-in-from-top-2 duration-300">
+                        {(task.status === "pending" || task.status === "running") && (
+                          <div className="mb-4 flex justify-end">
+                            <button
+                              type="button"
+                              onClick={() => void handleCancelTask(task.id)}
+                              disabled={cancellingTaskId === task.id}
+                              className="rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-2 text-[11px] font-mono uppercase tracking-[0.22em] text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {cancellingTaskId === task.id ? "Cancelling task..." : "Cancel task"}
+                            </button>
+                          </div>
+                        )}
                         {/* SubTasks Section */}
                         <div className="mb-6">
                           <h4 className="text-[10px] font-mono text-text-dim uppercase tracking-widest mb-3 flex items-center gap-2">

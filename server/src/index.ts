@@ -23,8 +23,15 @@ import {
 } from './memory.js';
 import { getAgentActivitySnapshots, getAgentSnapshots } from './agents.js';
 import { getQueueSnapshot, nudgeQueue, startQueueWorker } from './queue.js';
-import { getWorkspaceStatus } from './shell.js';
+import {
+  ensureWorkspaceReady,
+  getGithubRuntimeHealth,
+  getWorkspaceStatus,
+  syncRuntimeSecretsToContainer,
+} from './shell.js';
 import { discoverSkills } from './skills.js';
+import { readAgentMailPublicConfig, writeAgentMailConfig } from './agent-mail.js';
+import { readGithubAuthPublicConfig, writeGithubAuthConfig } from './github-auth.js';
 
 const app = express();
 app.use(cors());
@@ -217,6 +224,90 @@ app.get('/skills', async (_req, res) => {
     res.json(discoverSkills('./skills'));
   } catch {
     res.status(500).json({ error: 'Failed to read skills' });
+  }
+});
+
+app.get('/agent-mail', async (_req, res) => {
+  try {
+    res.json((await readAgentMailPublicConfig()) ?? null);
+  } catch {
+    res.status(500).json({ error: 'Failed to read agent mail config' });
+  }
+});
+
+app.post('/agent-mail', async (req, res) => {
+  const email = String(req.body?.email ?? '').trim();
+  const clientId = String(req.body?.clientId ?? '').trim();
+  const clientSecret = String(req.body?.clientSecret ?? '');
+  const refreshToken = String(req.body?.refreshToken ?? '');
+  const accessToken = String(req.body?.accessToken ?? '');
+  const authorizationCode = String(req.body?.authorizationCode ?? '');
+  const redirectUri = String(req.body?.redirectUri ?? '').trim();
+  const displayName = String(req.body?.displayName ?? '').trim();
+  const ownerEmail = String(req.body?.ownerEmail ?? '').trim();
+  const signature = String(req.body?.signature ?? '').trim();
+
+  if (!email) {
+    return res.status(400).json({ error: 'email is required' });
+  }
+
+  try {
+    const saved = await writeAgentMailConfig({
+      email,
+      clientId,
+      clientSecret,
+      refreshToken,
+      accessToken,
+      authorizationCode,
+      redirectUri,
+      displayName,
+      ownerEmail,
+      signature,
+    });
+    await ensureWorkspaceReady();
+    await syncRuntimeSecretsToContainer();
+    res.json(saved);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Failed to save agent mail config' });
+  }
+});
+
+app.get('/github-auth', async (_req, res) => {
+  try {
+    res.json((await readGithubAuthPublicConfig()) ?? null);
+  } catch {
+    res.status(500).json({ error: 'Failed to read GitHub auth config' });
+  }
+});
+
+app.post('/github-auth', async (req, res) => {
+  const token = String(req.body?.token ?? '');
+  const username = String(req.body?.username ?? '').trim();
+  const email = String(req.body?.email ?? '').trim();
+
+  try {
+    const saved = await writeGithubAuthConfig({
+      token,
+      username,
+      email,
+    });
+    await ensureWorkspaceReady();
+    await syncRuntimeSecretsToContainer();
+    res.json(saved);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Failed to save GitHub auth config' });
+  }
+});
+
+app.get('/github-auth/health', async (_req, res) => {
+  try {
+    await ensureWorkspaceReady();
+    await syncRuntimeSecretsToContainer();
+    res.json(await getGithubRuntimeHealth());
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to inspect GitHub runtime health',
+    });
   }
 });
 

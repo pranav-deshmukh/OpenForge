@@ -1,4 +1,15 @@
 import type { AgentPersona, Task, SubTask, Artifact } from './types.js';
+import { buildSkillCatalog, discoverSkills } from './skills.js';
+
+function getSkillPromptBlock(): string {
+  const skills = discoverSkills('./skills');
+  if (skills.length === 0) return 'No skills available.';
+  return `Available skills:\n${buildSkillCatalog(skills)}`;
+}
+
+function getMailboxPromptBlock(): string {
+  return 'Mailbox credentials are provisioned by the server. If the task actually involves email, use the gmail-assistant skill and never print secrets.';
+}
 
 export function getSystemPrompt(persona: AgentPersona, context: {
   task: Task;
@@ -49,6 +60,8 @@ You do not have access to tools or code execution in this mode. If the user asks
 ${commonContext}
 
 You have access to a shell and various skills. Your goal is to complete the task linearly.
+${getSkillPromptBlock()}
+${getMailboxPromptBlock()}
 
 ## CRITICAL FILE EDITING RULES
 
@@ -57,6 +70,8 @@ You have access to a shell and various skills. Your goal is to complete the task
 For a direct single-file edit request, do not start with broad exploration like \`ls -R\`.
 If the target file path is known, read that file first.
 If the target path is unknown, use a narrow search such as \`rg --files\` or \`rg "pattern"\` in the most relevant directory.
+Shell invocations are isolated. Directory changes do not persist unless you include them in the same command, so prefer \`cd repo && git status\` style commands.
+For Git repository tasks, inspect repo state first and create a feature branch before editing or committing. Do not commit on \`main\`.
 
 For editing existing files, use str_replace_file or insert_at_line.
 For new files, use a shell command like: cat > /workspace/file.ts << 'EOF' ... EOF
@@ -70,7 +85,8 @@ You have access to the following tools — use whichever fits the current need:
 - ask_user: ask the user a question if genuinely blocked.
 - task_done: call when all success criteria are met.
 
-Ground every action in empirical evidence. Read before you edit. Verify after you edit.`;
+Ground every action in empirical evidence. Read before you edit. Verify after you edit.
+If the task involves email, read the relevant skill first and follow it exactly. Do not guess with local commands like \`mail\` or \`sendmail\`.`; 
 
     case 'coordinator':
       return `You are Forge, the supervisor agent. Your job is to manage the execution of a Directed Acyclic Graph (DAG) of SubTasks.
@@ -143,6 +159,8 @@ Input Artifacts: ${JSON.stringify(artifacts?.filter(a => subTask.inputArtifacts.
 Success Criteria: ${subTask.successCriteria.join(', ')}
 Workspace Scope: ${subTask.workspaceScope.join(', ') || 'Not specified'}
 Locked Paths: ${subTask.lockedPaths.join(', ') || 'Not specified'}
+${getSkillPromptBlock()}
+${getMailboxPromptBlock()}
 
 ## EXECUTION RESPONSIBILITY
 You are a senior engineer. You are responsible for ALL implementation details within this milestone:
@@ -156,6 +174,8 @@ You MUST NOT drift into other milestones. Focus ONLY on completing this one comp
 ## CRITICAL FILE EDITING RULES
 **NEVER rewrite an entire file.** Use str_replace_file for ALL edits to existing files.
 Always read a file before editing it. Verify your changes with tests after editing.
+Shell invocations are isolated. Directory changes do not persist unless you include them in the same command, so prefer \`cd repo && git status\` style commands.
+For Git repository tasks, inspect repo state first and create a feature branch before editing or committing. Do not commit on \`main\`.
 
 You have access to the following tools:
 - run_shell: run bash commands.
@@ -163,7 +183,9 @@ You have access to the following tools:
 - str_replace_file: surgically edit existing files.
 - insert_at_line: insert text at a specific line.
 - ask_user: ask if genuinely blocked.
-- task_done: call when the milestone is complete.`;
+- task_done: call when the milestone is complete.
+
+If the task involves email, read the relevant skill first and follow it exactly. Do not guess with local commands like \`mail\` or \`sendmail\`.`; 
 
     case 'verifier':
       if (!subTask) throw new Error('Verifier requires a subTask');

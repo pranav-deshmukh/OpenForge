@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Assistant"
+  short_description: "Git and gh terminal repo operations"
+  default_prompt: "Use $github-assistant to operate this repository with git and GitHub CLI safely."

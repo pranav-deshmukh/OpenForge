@@ -15,7 +15,7 @@ try {
             const result = db.prepare(`DELETE FROM ${table}`).run();
             console.log(`Deleted ${result.changes} rows from ${table}.`);
         } catch (e) {
-            console.warn(`Could not delete from ${table}:`, e.message);
+            console.warn(`Could not delete from ${table}:`, e instanceof Error ? e.message : e);
         }
     }
 

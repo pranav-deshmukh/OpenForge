@@ -25,6 +25,7 @@ import {
 import { getSystemPrompt } from './prompts.js';
 import { releaseWorkspaceLocks, tryAcquireWorkspaceLocks } from './workspace-locks.js';
 import type { AgentId, Message, Task, SubTask } from './types.js';
+import path from 'path';
 
 const MAX_ITERATIONS_PER_SUBTASK = 50;
 const MAX_ITERATIONS_TOOL_MODE = 15;
@@ -39,6 +40,7 @@ const MAX_NO_PROGRESS = 5;
 const MAX_TOTAL_AGENT_STEPS = 150;
 const MAX_REPLAN_ATTEMPTS = 2;
 const MAX_RETRIES_PER_TASK = 2;
+const MAX_TOOL_OUTPUT_CHARS = 12000;
 
 function isTaskCancelled(taskId: string): boolean {
   return getTask(taskId)?.status === 'cancelled';
@@ -257,6 +259,47 @@ async function findExistingFileOverwriteTarget(command: string): Promise<string 
   return null;
 }
 
+function truncateToolOutput(output: string, limit = MAX_TOOL_OUTPUT_CHARS): string {
+  if (output.length <= limit) return output;
+  const omitted = output.length - limit;
+  return `${output.slice(0, limit)}\n\n[output truncated: ${omitted} more characters omitted]`;
+}
+
+function isNoisyDiscoveryCommand(command: string): boolean {
+  const normalized = command.trim().toLowerCase();
+  return normalized === 'ls -r' || normalized === 'ls -rf' || normalized.startsWith('ls -r ');
+}
+
+function maybeUpdateWorkingDirectory(currentDirectory: string | null, command: string, exitCode: number): string | null {
+  if (exitCode !== 0) {
+    return currentDirectory;
+  }
+
+  const match = command.match(/^\s*cd\s+([^\s;&|]+)\s*(?:&&|$)/);
+  if (!match) {
+    return currentDirectory;
+  }
+
+  const nextDirectory = match[1]?.trim();
+  if (!nextDirectory) {
+    return currentDirectory;
+  }
+
+  if (nextDirectory.startsWith('/')) {
+    return path.posix.normalize(nextDirectory);
+  }
+
+  const base = currentDirectory || '/workspace';
+  return path.posix.normalize(path.posix.join(base, nextDirectory));
+}
+
+function applyWorkingDirectory(command: string, currentDirectory: string | null): string {
+  if (!currentDirectory) {
+    return command;
+  }
+  return `cd ${JSON.stringify(currentDirectory)} && ${command}`;
+}
+
 async function blockExistingFileOverwrite(
   taskId: string,
   subTaskId: string | null,
@@ -332,6 +375,7 @@ If you need a package NOT in the above list, install it normally. It will persis
 
   // Initialize with task createdAt - 1 to catch very early inputs
   let lastProcessedInputTime = task.createdAt - 1;
+  let currentWorkingDirectory: string | null = null;
 
   for (let i = 1; i <= MAX_ITERATIONS_TOOL_MODE; i++) {
     if (isTaskCancelled(task.id)) {
@@ -398,8 +442,8 @@ If you need a package NOT in the above list, install it normally. It will persis
       const { path } = toolCall.args;
       saveMemory(task.id, 'command', `[read_file] ${path}`, null, 'working');
       const result = await readFileFromContainer(path);
-      const output = result.stdout || '(empty file)';
-      saveMemory(task.id, 'output', output.slice(0, 2000), null, 'working');
+      const output = truncateToolOutput(result.stdout || '(empty file)');
+      saveMemory(task.id, 'output', output, null, 'working');
       conversationHistory.push({ role: 'user', content: `Contents of ${path}:\n${output}` });
       continue;
     }
@@ -408,7 +452,7 @@ If you need a package NOT in the above list, install it normally. It will persis
       const { file, old_str, new_str } = toolCall.args;
       saveMemory(task.id, 'command', `[str_replace] ${file}`, null, 'working');
       const result = await strReplaceInContainer(file, old_str, new_str);
-      const output = (result.stdout + result.stderr) || '(no output)';
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
       conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
       continue;
@@ -418,7 +462,7 @@ If you need a package NOT in the above list, install it normally. It will persis
       const { file, line, text } = toolCall.args;
       saveMemory(task.id, 'command', `[insert_at_line] ${file}:${line}`, null, 'working');
       const result = await insertAtLineInContainer(file, line, text);
-      const output = (result.stdout + result.stderr) || '(no output)';
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
       conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
       continue;
@@ -426,6 +470,16 @@ If you need a package NOT in the above list, install it normally. It will persis
 
     if (toolCall.name === 'run_shell') {
       const { command } = toolCall.args;
+
+      if (isNoisyDiscoveryCommand(command)) {
+        saveMemory(task.id, 'security_alert', `Blocked noisy discovery command: ${command}`, null, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content:
+            'Do not use recursive ls output. Use a narrow command such as `rg --files`, `find . -maxdepth 2 -type f | sort`, or `ls` in a specific directory.',
+        });
+        continue;
+      }
 
       if (await blockExistingFileOverwrite(task.id, null, command, conversationHistory)) {
         continue;
@@ -439,9 +493,11 @@ If you need a package NOT in the above list, install it normally. It will persis
         continue;
       }
 
-      saveMemory(task.id, 'command', `$ ${command}`, null, 'working');
-      const result = await execInContainer(command);
-      const output = (result.stdout + result.stderr) || '(no output)';
+      const effectiveCommand = applyWorkingDirectory(command, currentWorkingDirectory);
+      saveMemory(task.id, 'command', `$ ${effectiveCommand}`, null, 'working');
+      const result = await execInContainer(effectiveCommand);
+      currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
       conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
       continue;
@@ -929,6 +985,7 @@ If you need a package NOT in the above list, install it normally. It will persis
   let lastProcessedInputTime = subTask.createdAt - 1;
   let consecutiveNoProgress = 0;
   let lastState = { thought: '', toolName: '', toolArgs: '' };
+  let currentWorkingDirectory: string | null = null;
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
     if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
@@ -1052,8 +1109,8 @@ If you need a package NOT in the above list, install it normally. It will persis
       const { path } = toolCall.args;
       saveMemory(task.id, 'command', `[read_file] ${path}`, subTask.id, 'working');
       const result = await readFileFromContainer(path);
-      const output = result.stdout || '(empty file)';
-      saveMemory(task.id, 'output', output.slice(0, 2000), subTask.id, 'working');
+      const output = truncateToolOutput(result.stdout || '(empty file)');
+      saveMemory(task.id, 'output', output, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `Contents of ${path}:\n${output}` });
       continue;
     }
@@ -1062,7 +1119,7 @@ If you need a package NOT in the above list, install it normally. It will persis
       const { file, old_str, new_str } = toolCall.args;
       saveMemory(task.id, 'command', `[str_replace] ${file}`, subTask.id, 'working');
       const result = await strReplaceInContainer(file, old_str, new_str);
-      const output = (result.stdout + result.stderr) || '(no output)';
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
       continue;
@@ -1072,7 +1129,7 @@ If you need a package NOT in the above list, install it normally. It will persis
       const { file, line, text } = toolCall.args;
       saveMemory(task.id, 'command', `[insert_at_line] ${file}:${line}`, subTask.id, 'working');
       const result = await insertAtLineInContainer(file, line, text);
-      const output = (result.stdout + result.stderr) || '(no output)';
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
       continue;
@@ -1080,6 +1137,16 @@ If you need a package NOT in the above list, install it normally. It will persis
 
     if (toolCall.name === 'run_shell') {
       const { command } = toolCall.args;
+
+      if (isNoisyDiscoveryCommand(command)) {
+        saveMemory(task.id, 'security_alert', `Blocked noisy discovery command: ${command}`, subTask.id, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content:
+            'Do not use recursive ls output. Use a narrow command such as `rg --files`, `find . -maxdepth 2 -type f | sort`, or `ls` in a specific directory.',
+        });
+        continue;
+      }
 
       if (await blockExistingFileOverwrite(task.id, subTask.id, command, conversationHistory)) {
         continue;
@@ -1110,9 +1177,11 @@ If you need a package NOT in the above list, install it normally. It will persis
         continue;
       }
 
-      saveMemory(task.id, 'command', `$ ${command}`, subTask.id, 'working');
-      const result = await execInContainer(command, 600000);
-      const output = (result.stdout + result.stderr) || '(no output)';
+      const effectiveCommand = applyWorkingDirectory(command, currentWorkingDirectory);
+      saveMemory(task.id, 'command', `$ ${effectiveCommand}`, subTask.id, 'working');
+      const result = await execInContainer(effectiveCommand, 600000);
+      currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
       continue;
