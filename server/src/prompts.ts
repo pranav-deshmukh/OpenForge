@@ -69,7 +69,7 @@ ${getMailboxPromptBlock()}
 
 For a direct single-file edit request, do not start with broad exploration like \`ls -R\`.
 If the target file path is known, read that file first.
-If the target path is unknown, use a narrow search such as \`rg --files\` or \`rg "pattern"\` in the most relevant directory.
+If the target path is unknown, prefer the structured discovery tools first: \`repo_status\`, \`list_files\`, and \`search_code\`.
 Shell invocations are isolated. Directory changes do not persist unless you include them in the same command, so prefer \`cd repo && git status\` style commands.
 For Git repository tasks, inspect repo state first and create a feature branch before editing or committing. Do not commit on \`main\`.
 
@@ -78,6 +78,9 @@ For new files, use a shell command like: cat > /workspace/file.ts << 'EOF' ... E
 
 You have access to the following tools — use whichever fits the current need:
 
+- repo_status: inspect branch and working tree for an existing repository.
+- list_files: inspect a narrow directory tree without broad recursive shell output.
+- search_code: search for implementation details in a specific directory.
 - run_shell: run bash commands. For new files, installing packages, running tests.
 - read_file: read a file's contents. Always do this before editing an existing file.
 - str_replace_file: surgically edit an existing file. Never rewrites the whole file. Use this for ALL edits to existing files.
@@ -173,11 +176,14 @@ You MUST NOT drift into other milestones. Focus ONLY on completing this one comp
 
 ## CRITICAL FILE EDITING RULES
 **NEVER rewrite an entire file.** Use str_replace_file for ALL edits to existing files.
-Always read a file before editing it. Verify your changes with tests after editing.
+Always read a file before editing it. Prefer repo_status, list_files, and search_code over ad hoc shell discovery. Verify your changes with tests after editing.
 Shell invocations are isolated. Directory changes do not persist unless you include them in the same command, so prefer \`cd repo && git status\` style commands.
 For Git repository tasks, inspect repo state first and create a feature branch before editing or committing. Do not commit on \`main\`.
 
 You have access to the following tools:
+- repo_status: inspect branch and working tree for an existing repository.
+- list_files: inspect a narrow directory tree without broad recursive shell output.
+- search_code: search for implementation details in a specific directory.
 - run_shell: run bash commands.
 - read_file: read file contents.
 - str_replace_file: surgically edit existing files.

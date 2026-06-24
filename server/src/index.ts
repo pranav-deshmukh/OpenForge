@@ -156,7 +156,15 @@ app.post('/tasks/:id/input', (req, res) => {
   if (!task) {
     return res.status(404).json({ error: 'Task not found' });
   }
+  const waitingSubTasks = getSubTasksForTask(req.params.id).filter(
+    (subTask) => subTask.status === 'waiting_for_human',
+  );
+
   const entry = saveMemory(req.params.id, 'input', content);
+  for (const subTask of waitingSubTasks) {
+    saveMemory(req.params.id, 'input', content, subTask.id);
+  }
+
   res.json(entry);
 });
 

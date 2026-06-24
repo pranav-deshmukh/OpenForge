@@ -334,6 +334,41 @@ export async function readFileFromContainer(
   return execInContainer(`cat ${shellQuote(filePath)}`);
 }
 
+export async function listFilesInContainer(
+  dirPath: string,
+  maxDepth = 4,
+): Promise<ShellResult> {
+  const safeDepth = Math.max(1, Math.min(8, Math.floor(maxDepth)));
+  const command = [
+    `find ${shellQuote(dirPath)}`,
+    `-maxdepth ${safeDepth}`,
+    `\\( -path '*/.git' -o -path '*/node_modules' -o -path '*/.next' \\) -prune -o`,
+    `\\( -type f -o -type d \\) -print`,
+    `| sort`,
+  ].join(' ');
+  return execInContainer(command);
+}
+
+export async function searchCodeInContainer(
+  dirPath: string,
+  pattern: string,
+  glob?: string,
+): Promise<ShellResult> {
+  const globArg = glob?.trim() ? ` -g ${shellQuote(glob.trim())}` : '';
+  const command =
+    `rg -n --hidden --glob '!**/.git/**' --glob '!**/node_modules/**' --glob '!**/.next/**'` +
+    `${globArg} ${shellQuote(pattern)} ${shellQuote(dirPath)}`;
+  return execInContainer(command);
+}
+
+export async function getRepoStatusInContainer(
+  dirPath: string,
+): Promise<ShellResult> {
+  return execInContainer(
+    `cd ${shellQuote(dirPath)} && git rev-parse --show-toplevel && echo '---' && git status --short --branch`,
+  );
+}
+
 async function containerHasSecretsMount(): Promise<boolean> {
   try {
     const result = await execDockerCommand([

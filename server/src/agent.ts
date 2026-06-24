@@ -1,12 +1,22 @@
 import { FunctionCallingConfigMode, GoogleGenAI } from '@google/genai';
 import type { Message } from './types.js';
 
+function isRateLimitError(err: any): boolean {
+  const status = err?.status ?? err?.code;
+  const message = String(err?.message ?? '');
+  return status === 429 || message.includes('RESOURCE_EXHAUSTED');
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function generateWithGemini(
   systemPrompt: string,
   messages: Message[],
   responseMimeType: 'application/json' | 'text/plain' = 'application/json'
 ): Promise<string> {
-  const provider = process.env.AI_PROVIDER || 'vertex'; // 'vertex' or 'google'
+  const provider = process.env.AI_PROVIDER || 'vertex';
   const model = process.env.GEMINI_MODEL ?? process.env.VERTEXAI_MODEL ?? 'gemini-1.5-pro';
 
   let ai: GoogleGenAI;
@@ -26,10 +36,10 @@ async function generateWithGemini(
   } else {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error('Missing GEMINI_API_KEY for Google GenAI');
-    
+
     console.log(`[LLM] Calling Google GenAI ${model}...`);
     ai = new GoogleGenAI({
-      apiKey
+      apiKey,
     });
   }
 
@@ -48,9 +58,7 @@ async function generateWithGemini(
   });
 
   console.log(`[LLM] Response received from ${model}`);
-  
-  // For @google/genai, the text might be in result.text or result.response.text()
-  // Let's try to be robust.
+
   let text = '';
   if (typeof (result as any).text === 'string') {
     text = (result as any).text;
@@ -75,11 +83,10 @@ export async function callLLM(
   try {
     return await generateWithGemini(systemPrompt, msgArray, responseMimeType);
   } catch (err: any) {
-    console.error(`[LLM] Error calling Gemini:`, err.message || err);
-    const status = err?.status ?? err?.code;
-    if (status === 429) {
+    console.error('[LLM] Error calling Gemini:', err.message || err);
+    if (isRateLimitError(err)) {
       console.log('[LLM] API rate limited, waiting 15s...');
-      await new Promise((r) => setTimeout(r, 15000));
+      await sleep(15000);
       return callLLM(systemPrompt, messages, responseMimeType);
     }
     throw err;
@@ -89,7 +96,7 @@ export async function callLLM(
 export interface ToolDefinition {
   name: string;
   description: string;
-  parameters: Record<string, any>; // JSON Schema object
+  parameters: Record<string, any>;
 }
 
 export interface ToolCall {
@@ -108,6 +115,15 @@ export async function callLLMWithTools(
   messages: Message[],
   tools: ToolDefinition[]
 ): Promise<LLMToolResponse> {
+  return callLLMWithToolsAttempt(systemPrompt, messages, tools, 1);
+}
+
+async function callLLMWithToolsAttempt(
+  systemPrompt: string,
+  messages: Message[],
+  tools: ToolDefinition[],
+  attempt: number,
+): Promise<LLMToolResponse> {
   const provider = process.env.AI_PROVIDER || 'vertex';
   const model = process.env.GEMINI_MODEL ?? process.env.VERTEXAI_MODEL ?? 'gemini-1.5-pro';
 
@@ -125,92 +141,104 @@ export async function callLLMWithTools(
   }
 
   const geminiTools = [{
-    functionDeclarations: tools.map(t => ({
-      name: t.name,
-      description: t.description,
-      parametersJsonSchema: t.parameters,
-    }))
+    functionDeclarations: tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parametersJsonSchema: tool.parameters,
+    })),
   }];
 
   console.log(`[LLM] Calling ${model} with ${tools.length} tools...`);
 
-  const result = await ai.models.generateContent({
-    model,
-    contents: messages.map((m) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    })),
-    config: {
-      systemInstruction: systemPrompt,
-      temperature: 0.2,
-      tools: geminiTools,
-      toolConfig: {
-        functionCallingConfig: {
-          mode: FunctionCallingConfigMode.ANY,
+  try {
+    const result = await ai.models.generateContent({
+      model,
+      contents: messages.map((m) => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }],
+      })),
+      config: {
+        systemInstruction: systemPrompt,
+        temperature: 0.2,
+        tools: geminiTools,
+        toolConfig: {
+          functionCallingConfig: {
+            mode: FunctionCallingConfigMode.ANY,
+          },
         },
       },
-    },
-  });
+    });
 
-  let thought = result.text?.replace(/<think>[\s\S]*?<\/think>/g, '').trim() ?? '';
-  let toolCall: ToolCall | null = null;
+    let thought = result.text?.replace(/<think>[\s\S]*?<\/think>/g, '').trim() ?? '';
+    let toolCall: ToolCall | null = null;
 
-  const directFunctionCall = result.functionCalls?.[0];
-  if (directFunctionCall?.name) {
-    toolCall = {
-      name: directFunctionCall.name,
-      args: directFunctionCall.args ?? {},
-    };
-  }
+    const directFunctionCall = result.functionCalls?.[0];
+    if (directFunctionCall?.name) {
+      toolCall = {
+        name: directFunctionCall.name,
+        args: directFunctionCall.args ?? {},
+      };
+    }
 
-  if (!toolCall) {
-    const parts = result.candidates?.[0]?.content?.parts ?? [];
-    for (const part of parts) {
-      if (part.text) {
-        thought += part.text;
-      }
-      if (part.functionCall?.name) {
-        toolCall = {
-          name: part.functionCall.name,
-          args: part.functionCall.args ?? {},
-        };
+    if (!toolCall) {
+      const parts = result.candidates?.[0]?.content?.parts ?? [];
+      for (const part of parts) {
+        if (part.text) {
+          thought += part.text;
+        }
+        if (part.functionCall?.name) {
+          toolCall = {
+            name: part.functionCall.name,
+            args: part.functionCall.args ?? {},
+          };
+        }
       }
     }
-  }
 
-  // Fallback: if model returned plain text JSON (some Gemini versions do this)
-  if (!toolCall && thought) {
-    try {
-      const cleaned = thought
-        .replace(/```json\n?/g, '')
-        .replace(/```\n?/g, '')
-        .replace(/<think>[\s\S]*?<\/think>/g, '')
-        .trim();
-      const parsed = JSON.parse(cleaned);
-      // If it looks like a tool call in old format, convert it
-      if (parsed.command && parsed.command !== '' && parsed.command !== 'ask_user') {
-        toolCall = { name: 'run_shell', args: { command: parsed.command } };
-        thought = parsed.thought ?? thought;
-      } else if (parsed.str_replace) {
-        toolCall = { name: 'str_replace_file', args: parsed.str_replace };
-        thought = parsed.thought ?? thought;
-      } else if (parsed.insert_at_line) {
-        toolCall = { name: 'insert_at_line', args: parsed.insert_at_line };
-        thought = parsed.thought ?? thought;
-      } else if (parsed.read_file) {
-        toolCall = { name: 'read_file', args: { path: parsed.read_file } };
-        thought = parsed.thought ?? thought;
-      } else if (parsed.done) {
-        toolCall = { name: 'task_done', args: { summary: parsed.summary ?? '', artifacts: parsed.artifacts ?? [] } };
-        thought = parsed.thought ?? thought;
-      } else if (parsed.command === 'ask_user') {
-        toolCall = { name: 'ask_user', args: { question: parsed.thought ?? '' } };
-        thought = parsed.thought ?? thought;
+    if (!toolCall && thought) {
+      try {
+        const cleaned = thought
+          .replace(/```json\n?/g, '')
+          .replace(/```\n?/g, '')
+          .replace(/<think>[\s\S]*?<\/think>/g, '')
+          .trim();
+        const parsed = JSON.parse(cleaned);
+        if (parsed.command && parsed.command !== '' && parsed.command !== 'ask_user') {
+          toolCall = { name: 'run_shell', args: { command: parsed.command } };
+          thought = parsed.thought ?? thought;
+        } else if (parsed.str_replace) {
+          toolCall = { name: 'str_replace_file', args: parsed.str_replace };
+          thought = parsed.thought ?? thought;
+        } else if (parsed.insert_at_line) {
+          toolCall = { name: 'insert_at_line', args: parsed.insert_at_line };
+          thought = parsed.thought ?? thought;
+        } else if (parsed.read_file) {
+          toolCall = { name: 'read_file', args: { path: parsed.read_file } };
+          thought = parsed.thought ?? thought;
+        } else if (parsed.done) {
+          toolCall = {
+            name: 'task_done',
+            args: { summary: parsed.summary ?? '', artifacts: parsed.artifacts ?? [] },
+          };
+          thought = parsed.thought ?? thought;
+        } else if (parsed.command === 'ask_user') {
+          toolCall = { name: 'ask_user', args: { question: parsed.thought ?? '' } };
+          thought = parsed.thought ?? thought;
+        }
+      } catch {
+        // Not JSON, keep thought-only response.
       }
-    } catch {
-      // Not JSON, that's fine — thought text only
     }
-  }
 
-  return { thought, toolCall, rawText: thought };
+    return { thought, toolCall, rawText: thought };
+  } catch (err: any) {
+    console.error(`[LLM] Tool call error on attempt ${attempt}:`, err.message || err);
+    if (isRateLimitError(err) && attempt < 4) {
+      const delayMs = 5000 * attempt;
+      console.log(`[LLM] Tool call rate limited, waiting ${delayMs}ms before retry...`);
+      await sleep(delayMs);
+      return callLLMWithToolsAttempt(systemPrompt, messages, tools, attempt + 1);
+    }
+    throw err;
+  }
 }

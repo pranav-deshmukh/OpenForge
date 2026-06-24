@@ -5,6 +5,9 @@ import {
   execInContainer,
   strReplaceInContainer,
   readFileFromContainer,
+  listFilesInContainer,
+  searchCodeInContainer,
+  getRepoStatusInContainer,
   insertAtLineInContainer,
   pathExistsInContainer,
   getPreinstalledPackages,
@@ -24,11 +27,26 @@ import {
 } from './agents.js';
 import { getSystemPrompt } from './prompts.js';
 import { releaseWorkspaceLocks, tryAcquireWorkspaceLocks } from './workspace-locks.js';
-import type { AgentId, Message, Task, SubTask } from './types.js';
+import type { AgentId, AgentMode, Message, Task, SubTask } from './types.js';
 import path from 'path';
 
-const MAX_ITERATIONS_PER_SUBTASK = 50;
-const MAX_ITERATIONS_TOOL_MODE = 15;
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const MAX_ITERATIONS_PER_SUBTASK = parsePositiveIntEnv('MAX_ITERATIONS_PER_SUBTASK', 75);
+const LEGACY_TOOL_MODE_ITERATIONS = parsePositiveIntEnv('MAX_ITERATIONS_TOOL_MODE', 60);
+const MAX_ITERATIONS_TOOL_MODE_FAST = parsePositiveIntEnv(
+  'MAX_ITERATIONS_TOOL_MODE_FAST',
+  LEGACY_TOOL_MODE_ITERATIONS,
+);
+const MAX_ITERATIONS_TOOL_MODE_RESEARCH = parsePositiveIntEnv(
+  'MAX_ITERATIONS_TOOL_MODE_RESEARCH',
+  Math.max(MAX_ITERATIONS_TOOL_MODE_FAST, 120),
+);
 const MAX_SUBTASK_RETRIES = 3;
 const CONCURRENT_WORKERS = 2;
 
@@ -37,10 +55,102 @@ const MAX_TOTAL_SUBTASKS = 12;
 const MAX_DAG_DEPTH = 3;
 const MAX_NO_PROGRESS = 5;
 
-const MAX_TOTAL_AGENT_STEPS = 150;
+const LEGACY_TOTAL_AGENT_STEPS = parsePositiveIntEnv('MAX_TOTAL_AGENT_STEPS', 300);
+const MAX_TOTAL_AGENT_STEPS_FAST = parsePositiveIntEnv(
+  'MAX_TOTAL_AGENT_STEPS_FAST',
+  LEGACY_TOTAL_AGENT_STEPS,
+);
+const MAX_TOTAL_AGENT_STEPS_RESEARCH = parsePositiveIntEnv(
+  'MAX_TOTAL_AGENT_STEPS_RESEARCH',
+  Math.max(MAX_TOTAL_AGENT_STEPS_FAST, 600),
+);
 const MAX_REPLAN_ATTEMPTS = 2;
 const MAX_RETRIES_PER_TASK = 2;
 const MAX_TOOL_OUTPUT_CHARS = 12000;
+
+function getEffectiveAgentMode(task: Task): AgentMode {
+  return task.agentMode === 'RESEARCH' ? 'RESEARCH' : 'FAST';
+}
+
+function getToolModeIterationLimit(task: Task): number {
+  return getEffectiveAgentMode(task) === 'RESEARCH'
+    ? MAX_ITERATIONS_TOOL_MODE_RESEARCH
+    : MAX_ITERATIONS_TOOL_MODE_FAST;
+}
+
+function getTotalAgentStepBudget(task: Task): number {
+  return getEffectiveAgentMode(task) === 'RESEARCH'
+    ? MAX_TOTAL_AGENT_STEPS_RESEARCH
+    : MAX_TOTAL_AGENT_STEPS_FAST;
+}
+
+function chooseAgentMode(goal: string, mode: Task['mode'] | null): AgentMode {
+  const text = goal.trim().toLowerCase();
+  if (mode === 'autonomous_dag') {
+    return 'RESEARCH';
+  }
+
+  if (
+    /(github\.com|pull request|\bpr\b|issue\s*#?\d+|repo\b|repository\b|codebase\b|local repo\b)/.test(text) &&
+    /(fix|debug|investigate|implement|refactor|test|create pr|open pr|submit pr|regression)/.test(text)
+  ) {
+    return 'RESEARCH';
+  }
+
+  if (
+    text.split(/\s+/).length > 30 ||
+    /(complex|complicated|thorough|end-to-end|root cause|production|architecture|multi-step)/.test(text)
+  ) {
+    return 'RESEARCH';
+  }
+
+  return 'FAST';
+}
+
+function extractGithubRepoName(goal: string): string | null {
+  const match = goal.match(/github\.com\/[^/\s]+\/([^/\s;?#]+?)(?:\.git)?(?:[/?#]|\s|$)/i);
+  return match?.[1] ?? null;
+}
+
+async function resolveKnownRepoRoot(task: Task, subTask?: SubTask): Promise<string | null> {
+  const candidates = new Set<string>();
+  const repoName = extractGithubRepoName(task.goal);
+  if (repoName) {
+    candidates.add(`/workspace/${repoName}`);
+  }
+
+  for (const scope of subTask?.workspaceScope ?? []) {
+    const trimmed = scope.trim().replace(/^\.?\//, '');
+    if (!trimmed) continue;
+    const topLevel = trimmed.split('/')[0];
+    if (topLevel) {
+      candidates.add(`/workspace/${topLevel}`);
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (await pathExistsInContainer(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+async function buildRepoContextMessage(task: Task, subTask?: SubTask): Promise<string> {
+  const repoRoot = await resolveKnownRepoRoot(task, subTask);
+  if (!repoRoot) {
+    return '';
+  }
+
+  return [
+    '## Known Repository Context',
+    `Local repo root already exists: ${repoRoot}`,
+    'Do not clone this repository again.',
+    `Prefer operating relative to ${repoRoot}.`,
+    'Use structured discovery tools first: repo_status, list_files, search_code, then read_file before editing.',
+  ].join('\n');
+}
 
 function isTaskCancelled(taskId: string): boolean {
   return getTask(taskId)?.status === 'cancelled';
@@ -91,6 +201,13 @@ function heuristicRouteTask(goal: string): Task['mode'] | null {
   if (
     /(build|create|implement|research and implement|multi-step|full-stack|system|architecture|workflow|saas|agent)\b/.test(text) &&
     /(app|project|system|workflow|service|dashboard|platform|research)\b/.test(text)
+  ) {
+    return 'autonomous_dag';
+  }
+
+  if (
+    /(github\.com|issue\s*#?\d+|pull request|\bpr\b|repo\b|repository\b|codebase\b|local repo\b)/.test(text) &&
+    /(fix|debug|investigate|implement|refactor|test|review|create pr|open pr|submit pr)/.test(text)
   ) {
     return 'autonomous_dag';
   }
@@ -155,7 +272,7 @@ export async function processTask(task: Task): Promise<void> {
     if (!currentTask.mode) {
       console.log(`[Router] Classifying intent for: ${currentTask.goal}`);
       const mode = await routeTask(currentTask);
-      updateTask(currentTask.id, { mode });
+      updateTask(currentTask.id, { mode, agentMode: chooseAgentMode(currentTask.goal, mode) });
       currentTask = getTask(currentTask.id)!;
     }
 
@@ -300,6 +417,20 @@ function applyWorkingDirectory(command: string, currentDirectory: string | null)
   return `cd ${JSON.stringify(currentDirectory)} && ${command}`;
 }
 
+type CommandReplay = {
+  output: string;
+  exitCode: number;
+};
+
+function buildRepeatCommandFeedback(command: string, replay: CommandReplay): string {
+  return (
+    `You already ran \`${command}\` and got exit ${replay.exitCode}. ` +
+    `Do not repeat the same shell command unless new information changes the situation.\n` +
+    `Previous output:\n${replay.output}\n\n` +
+    'Use that result and choose a narrower next step.'
+  );
+}
+
 async function blockExistingFileOverwrite(
   taskId: string,
   subTaskId: string | null,
@@ -348,6 +479,8 @@ async function runChatMode(task: Task) {
 }
 
 async function runToolMode(task: Task) {
+  const maxIterations = getToolModeIterationLimit(task);
+  const totalStepBudget = getTotalAgentStepBudget(task);
   updateTask(task.id, { status: 'running', startedAt: Date.now() });
   setAgentPhase('Forge', 'working', {
     currentTaskId: task.id,
@@ -357,6 +490,7 @@ async function runToolMode(task: Task) {
   await ensureWorkspaceReady();
   
   const preinstalled = await getPreinstalledPackages();
+  const repoContext = await buildRepoContextMessage(task);
   const envContext = `
 
 ## Environment — already installed, DO NOT reinstall these:
@@ -368,21 +502,36 @@ If you need a package NOT in the above list, install it normally. It will persis
 `;
 
   const systemPrompt = getSystemPrompt('standalone_worker', { task });
-  const conversationHistory: Message[] = [
-    { role: 'user', content: envContext },
-    { role: 'user', content: task.goal }
-  ];
+  const conversationHistory: Message[] = [{ role: 'user', content: envContext }];
+  if (repoContext) {
+    conversationHistory.push({ role: 'user', content: repoContext });
+  }
+  conversationHistory.push({ role: 'user', content: task.goal });
 
   // Initialize with task createdAt - 1 to catch very early inputs
   let lastProcessedInputTime = task.createdAt - 1;
-  let currentWorkingDirectory: string | null = null;
+  let currentWorkingDirectory: string | null = await resolveKnownRepoRoot(task);
+  const previousShellResults = new Map<string, CommandReplay>();
 
-  for (let i = 1; i <= MAX_ITERATIONS_TOOL_MODE; i++) {
+  for (let i = 1; i <= maxIterations; i++) {
     if (isTaskCancelled(task.id)) {
       clearAgentAssignment('Forge');
       return;
     }
     incrementTaskIterations(task.id);
+
+    const currentTask = getTask(task.id);
+    const nextTotalAgentSteps = (currentTask?.totalAgentSteps || 0) + 1;
+    updateTask(task.id, { totalAgentSteps: nextTotalAgentSteps });
+    if (nextTotalAgentSteps > totalStepBudget) {
+      updateTask(task.id, {
+        status: 'failed',
+        completedAt: Date.now(),
+        error: `Global agent step budget reached in Tool mode (${totalStepBudget} steps).`,
+      });
+      clearAgentAssignment('Forge');
+      return;
+    }
 
     // Check for user input
     const newInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
@@ -435,6 +584,36 @@ If you need a package NOT in the above list, install it normally. It will persis
       saveMemory(task.id, 'thought', `WAITING FOR USER: ${toolCall.args.question}`, null, 'working');
       lastProcessedInputTime = await waitForUserInput(task.id, null, lastProcessedInputTime);
       i--;
+      continue;
+    }
+
+    if (toolCall.name === 'repo_status') {
+      const { path } = toolCall.args;
+      saveMemory(task.id, 'command', `[repo_status] ${path}`, null, 'working');
+      const result = await getRepoStatusInContainer(path);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Repository status for ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'list_files') {
+      const { path, max_depth } = toolCall.args;
+      saveMemory(task.id, 'command', `[list_files] ${path} depth=${max_depth ?? 4}`, null, 'working');
+      const result = await listFilesInContainer(path, Number(max_depth ?? 4));
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Files under ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'search_code') {
+      const { path, pattern, glob } = toolCall.args;
+      saveMemory(task.id, 'command', `[search_code] ${path} :: ${pattern}`, null, 'working');
+      const result = await searchCodeInContainer(path, pattern, glob);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no matches)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Search results for ${JSON.stringify(pattern)} in ${path} (exit ${result.exitCode}):\n${output}` });
       continue;
     }
 
@@ -494,27 +673,43 @@ If you need a package NOT in the above list, install it normally. It will persis
       }
 
       const effectiveCommand = applyWorkingDirectory(command, currentWorkingDirectory);
+      const priorResult = previousShellResults.get(effectiveCommand);
+      if (priorResult) {
+        saveMemory(task.id, 'thought', `Blocked duplicate shell command: ${effectiveCommand}`, null, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content: buildRepeatCommandFeedback(effectiveCommand, priorResult),
+        });
+        continue;
+      }
+
       saveMemory(task.id, 'command', `$ ${effectiveCommand}`, null, 'working');
       const result = await execInContainer(effectiveCommand);
       currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
       conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
       continue;
     }
 
     // Unknown tool
-    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
   }
 
   if (!isTaskCancelled(task.id)) {
-    updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached in Tool mode' });
+    updateTask(task.id, {
+      status: 'failed',
+      completedAt: Date.now(),
+      error: `Tool mode iteration budget reached (${maxIterations} steps).`,
+    });
   }
   clearAgentAssignment('Forge');
 }
 
 export async function runOrchestrator(task: Task): Promise<void> {
   try {
+    const totalStepBudget = getTotalAgentStepBudget(task);
     console.log(`\n[Orchestrator] Starting: ${task.goal}`);
     updateTask(task.id, { 
       status: 'running', 
@@ -545,9 +740,9 @@ export async function runOrchestrator(task: Task): Promise<void> {
       }
 
       // Global Budget Check
-      if ((currentTask.totalAgentSteps || 0) >= MAX_TOTAL_AGENT_STEPS) {
-        console.error(`[Orchestrator] Execution terminated: Global budget exceeded (${MAX_TOTAL_AGENT_STEPS} steps).`);
-        saveMemory(task.id, 'error', `Execution terminated: Global budget exceeded (${MAX_TOTAL_AGENT_STEPS} steps).`, null, 'working');
+      if ((currentTask.totalAgentSteps || 0) >= totalStepBudget) {
+        console.error(`[Orchestrator] Execution terminated: Global budget exceeded (${totalStepBudget} steps).`);
+        saveMemory(task.id, 'error', `Execution terminated: Global budget exceeded (${totalStepBudget} steps).`, null, 'working');
         completed = true;
         break;
       }
@@ -665,7 +860,7 @@ export async function runOrchestrator(task: Task): Promise<void> {
     const summary = [
       finalTask.status === 'done' ? 'Goal achieved.' : 'Execution finished.',
       `Completed milestones: ${completedSubTasks.length}/${finalSubTasks.length}`,
-      `Total Agent Steps: ${finalTask.totalAgentSteps}/${MAX_TOTAL_AGENT_STEPS}`,
+      `Total Agent Steps: ${finalTask.totalAgentSteps}/${totalStepBudget}`,
       `Replans: ${finalTask.replanCount}/${MAX_REPLAN_ATTEMPTS}`,
       artifactNames.length > 0 ? `Artifacts: ${artifactNames.join(', ')}` : '',
     ].filter(Boolean).join('\n');
@@ -833,6 +1028,60 @@ async function planTask(task: Task) {
 // ── Tool definitions — the agent sees these and picks automatically ──────────
 const WORKER_TOOLS: ToolDefinition[] = [
   {
+    name: 'repo_status',
+    description: 'Inspect an existing git repository without guessing shell commands. Use this first for repo tasks to confirm the repo root and current branch/status.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute path to the repository root inside the container, e.g. /workspace/my-repo'
+        }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'list_files',
+    description: 'List files and directories in a narrow part of the workspace. Prefer this over broad shell discovery like find or ls -R.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute directory path to inspect inside the container'
+        },
+        max_depth: {
+          type: 'number',
+          description: 'Maximum directory depth to list. Keep this small, usually 2-4.'
+        }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'search_code',
+    description: 'Search code or text within a specific directory using ripgrep. Prefer this over ad hoc grep commands when locating implementation details.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute directory path to search inside the container'
+        },
+        pattern: {
+          type: 'string',
+          description: 'The text or regex pattern to search for'
+        },
+        glob: {
+          type: 'string',
+          description: 'Optional narrow file glob such as *.ts, *.tsx, or *.py'
+        }
+      },
+      required: ['path', 'pattern']
+    }
+  },
+  {
     name: 'run_shell',
     description: 'Run a bash command in the Docker workspace container. Use for: creating new files, installing packages, running tests, starting servers, listing directories, checking git status. Do NOT use for editing existing files — use str_replace_file instead.',
     parameters: {
@@ -964,6 +1213,7 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
   saveMemory(task.id, 'thought', `Worker starting subtask: ${subTask.title}`, subTask.id, 'working');
 
   const preinstalled = await getPreinstalledPackages();
+  const repoContext = await buildRepoContextMessage(task, subTask);
   const envContext = `
 
 ## Environment — already installed, DO NOT reinstall these:
@@ -977,15 +1227,20 @@ If you need a package NOT in the above list, install it normally. It will persis
   const artifacts = getArtifactsForTask(task.id);
   const systemPrompt = getSystemPrompt('worker', { task, subTask, artifacts });
 
-  const conversationHistory: Message[] = [
-    { role: 'user', content: envContext },
-    { role: 'user', content: `Start working on SubTask: ${subTask.title}\nDescription: ${subTask.description}` }
-  ];
+  const conversationHistory: Message[] = [{ role: 'user', content: envContext }];
+  if (repoContext) {
+    conversationHistory.push({ role: 'user', content: repoContext });
+  }
+  conversationHistory.push({
+    role: 'user',
+    content: `Start working on SubTask: ${subTask.title}\nDescription: ${subTask.description}`,
+  });
 
   let lastProcessedInputTime = subTask.createdAt - 1;
   let consecutiveNoProgress = 0;
   let lastState = { thought: '', toolName: '', toolArgs: '' };
-  let currentWorkingDirectory: string | null = null;
+  let currentWorkingDirectory: string | null = await resolveKnownRepoRoot(task, subTask);
+  const previousShellResults = new Map<string, CommandReplay>();
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
     if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
@@ -1105,6 +1360,36 @@ If you need a package NOT in the above list, install it normally. It will persis
       continue;
     }
 
+    if (toolCall.name === 'repo_status') {
+      const { path } = toolCall.args;
+      saveMemory(task.id, 'command', `[repo_status] ${path}`, subTask.id, 'working');
+      const result = await getRepoStatusInContainer(path);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Repository status for ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'list_files') {
+      const { path, max_depth } = toolCall.args;
+      saveMemory(task.id, 'command', `[list_files] ${path} depth=${max_depth ?? 4}`, subTask.id, 'working');
+      const result = await listFilesInContainer(path, Number(max_depth ?? 4));
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Files under ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'search_code') {
+      const { path, pattern, glob } = toolCall.args;
+      saveMemory(task.id, 'command', `[search_code] ${path} :: ${pattern}`, subTask.id, 'working');
+      const result = await searchCodeInContainer(path, pattern, glob);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no matches)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Search results for ${JSON.stringify(pattern)} in ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
     if (toolCall.name === 'read_file') {
       const { path } = toolCall.args;
       saveMemory(task.id, 'command', `[read_file] ${path}`, subTask.id, 'working');
@@ -1178,17 +1463,28 @@ If you need a package NOT in the above list, install it normally. It will persis
       }
 
       const effectiveCommand = applyWorkingDirectory(command, currentWorkingDirectory);
+      const priorResult = previousShellResults.get(effectiveCommand);
+      if (priorResult) {
+        saveMemory(task.id, 'thought', `Blocked duplicate shell command: ${effectiveCommand}`, subTask.id, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content: buildRepeatCommandFeedback(effectiveCommand, priorResult),
+        });
+        continue;
+      }
+
       saveMemory(task.id, 'command', `$ ${effectiveCommand}`, subTask.id, 'working');
       const result = await execInContainer(effectiveCommand, 600000);
       currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
       continue;
     }
 
     // Unknown tool - tell the model
-    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
   }
 
   if (!isTaskCancelled(task.id) && !isSubTaskCancelled(subTask.id)) {
