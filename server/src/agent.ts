@@ -17,7 +17,7 @@ async function generateWithGemini(
   responseMimeType: 'application/json' | 'text/plain' = 'application/json'
 ): Promise<string> {
   const provider = process.env.AI_PROVIDER || 'vertex';
-  const model = process.env.GEMINI_MODEL ?? process.env.VERTEXAI_MODEL ?? 'gemini-1.5-pro';
+  const model = process.env.GEMINI_MODEL ?? process.env.VERTEXAI_MODEL ?? 'gemini-2.5-pro';
 
   let ai: GoogleGenAI;
 
@@ -125,7 +125,7 @@ async function callLLMWithToolsAttempt(
   attempt: number,
 ): Promise<LLMToolResponse> {
   const provider = process.env.AI_PROVIDER || 'vertex';
-  const model = process.env.GEMINI_MODEL ?? process.env.VERTEXAI_MODEL ?? 'gemini-1.5-pro';
+  const model = process.env.GEMINI_MODEL ?? process.env.VERTEXAI_MODEL ?? 'gemini-2.5-pro';
 
   let ai: GoogleGenAI;
 
@@ -208,6 +208,9 @@ async function callLLMWithToolsAttempt(
           thought = parsed.thought ?? thought;
         } else if (parsed.str_replace) {
           toolCall = { name: 'str_replace_file', args: parsed.str_replace };
+          thought = parsed.thought ?? thought;
+        } else if (parsed.delete_block) {
+          toolCall = { name: 'delete_block_file', args: parsed.delete_block };
           thought = parsed.thought ?? thought;
         } else if (parsed.insert_at_line) {
           toolCall = { name: 'insert_at_line', args: parsed.insert_at_line };

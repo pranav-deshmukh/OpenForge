@@ -30,6 +30,27 @@ function withRuntimeEnv(command: string): string {
   return `if [ -f ${envPath} ]; then . ${envPath}; fi; ${command}`;
 }
 
+async function inspectContainerStatus(): Promise<string | null> {
+  try {
+    const result = await execDockerCommand(
+      ['inspect', '-f', '{{.State.Status}}', CONTAINER_NAME],
+      { quiet: true, quietOnError: true },
+    );
+    return result.stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function imageExists(imageName: string): Promise<boolean> {
+  try {
+    await execDockerCommand(['inspect', imageName], { quiet: true, quietOnError: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function execInContainer(
   command: string,
   timeoutMs = 60000
@@ -78,41 +99,32 @@ export async function execInContainer(
 
 export async function ensureWorkspaceReady(): Promise<void> {
   // 1. Check if container exists and its status
-  try {
+  const status = await inspectContainerStatus();
+  if (status) {
     if (!(await containerHasSecretsMount())) {
       console.log('[Shell] Workspace container missing /run/openforge mount. Recreating...');
-      await execDockerCommand(['rm', '-f', CONTAINER_NAME]);
+      await execDockerCommand(['rm', '-f', CONTAINER_NAME], { quiet: true, quietOnError: true });
       await startContainer();
       return;
     }
 
-    const result = await execDockerCommand([
-      'inspect', '-f', '{{.State.Status}}', CONTAINER_NAME
-    ]);
-    const status = result.stdout.trim();
-    
     if (status === 'running') {
       console.log(`[Shell] Workspace container is already running`);
       return;
     }
-    
+
     if (status === 'exited' || status === 'created' || status === 'paused') {
       console.log(`[Shell] Workspace container exists (${status}). Starting...`);
-      await execDockerCommand(['start', CONTAINER_NAME]);
+      await execDockerCommand(['start', CONTAINER_NAME], { quiet: true });
       return;
     }
-  } catch (err) {
-    // Container does not exist, proceed to check image
   }
 
   // 2. Check if the image already exists
-  try {
-    await execDockerCommand(['inspect', WORKSPACE_IMAGE]);
+  if (await imageExists(WORKSPACE_IMAGE)) {
     console.log(`[Shell] Workspace image found. Starting new container...`);
     await startContainer();
     return;
-  } catch (err) {
-    // Image does not exist, must build
   }
 
   // 3. Build image if missing
@@ -126,15 +138,20 @@ ENV PATH=$PATH:/usr/local/share/npm-global/bin
 # System packages
 RUN apt-get update && apt-get install -y \\
     curl wget git vim nano \\
+    ca-certificates gnupg \\
     python3 python3-pip python3-venv \\
-    nodejs npm \\
     build-essential \\
     jq unzip zip \\
+    gh \\
     ripgrep fd-find \\
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade npm itself
-RUN npm install -g npm@latest
+# Install a current Node.js runtime instead of Ubuntu's legacy package
+RUN mkdir -p /etc/apt/keyrings && \\
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \\
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \\
+    apt-get update && apt-get install -y nodejs && \\
+    rm -rf /var/lib/apt/lists/*
 
 # Pre-bake common global Node packages — agent won't need to reinstall these
 RUN npm install -g \\
@@ -172,7 +189,7 @@ CMD ["tail", "-f", "/dev/null"]
   mkdirSync('.docker-tmp', { recursive: true });
   writeFileSync('.docker-tmp/Dockerfile', dockerfile);
 
-  await execDockerCommand(['build', '-t', WORKSPACE_IMAGE, '.docker-tmp']);
+  await execDockerCommand(['build', '-t', WORKSPACE_IMAGE, '.docker-tmp'], { quiet: true });
   console.log(`[Shell] Workspace image built`);
 
   await startContainer();
@@ -181,7 +198,7 @@ CMD ["tail", "-f", "/dev/null"]
 async function startContainer(): Promise<void> {
   // Remove old stopped container if exists
   try {
-    await execDockerCommand(['rm', '-f', CONTAINER_NAME]);
+    await execDockerCommand(['rm', '-f', CONTAINER_NAME], { quiet: true, quietOnError: true });
   } catch {}
 
   const skillsPath = process.cwd() + '/skills';
@@ -210,7 +227,7 @@ async function startContainer(): Promise<void> {
     '-e', `TAVILY_API_KEY=${process.env.TAVILY_API_KEY ?? ''}`,
     '-e', `OPENROUTER_API_KEY=${process.env.OPENROUTER_API_KEY ?? ''}`,
     WORKSPACE_IMAGE,
-  ]);
+  ], { quiet: true });
 
   await applyGitIdentityInContainer();
   console.log(`[Shell] Workspace container started`);
@@ -221,23 +238,24 @@ export async function getWorkspaceStatus(): Promise<{
   imageName: string;
   status: 'running' | 'stopped' | 'missing';
 }> {
-  try {
-    const result = await execDockerCommand([
-      'inspect', '-f', '{{.State.Status}}', CONTAINER_NAME,
-    ]);
-    const status = result.stdout.trim();
-    if (status === 'running') {
-      return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'running' };
-    }
-    return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'stopped' };
-  } catch {
+  const status = await inspectContainerStatus();
+  if (!status) {
     return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'missing' };
   }
+  if (status === 'running') {
+    return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'running' };
+  }
+  return { containerName: CONTAINER_NAME, imageName: WORKSPACE_IMAGE, status: 'stopped' };
 }
 
 // Helper for docker commands that don't need stdin
-function execDockerCommand(args: string[]): Promise<ShellResult> {
-  console.log(`[Shell] $ docker ${args.join(' ')}`);
+function execDockerCommand(
+  args: string[],
+  options?: { quiet?: boolean; quietOnError?: boolean; streamOutput?: boolean },
+): Promise<ShellResult> {
+  if (!options?.quiet) {
+    console.log(`[Shell] $ docker ${args.join(' ')}`);
+  }
   return new Promise((resolve, reject) => {
     const proc = spawn('docker', args);
 
@@ -247,12 +265,16 @@ function execDockerCommand(args: string[]): Promise<ShellResult> {
     proc.stdout.on('data', (d) => {
       const chunk = d.toString();
       stdout += chunk;
-      process.stdout.write(chunk);
+      if (options?.streamOutput) {
+        process.stdout.write(chunk);
+      }
     });
     proc.stderr.on('data', (d) => {
       const chunk = d.toString();
       stderr += chunk;
-      process.stderr.write(chunk);
+      if (options?.streamOutput && !options?.quietOnError) {
+        process.stderr.write(chunk);
+      }
     });
 
     proc.on('close', (code) => {
@@ -330,8 +352,39 @@ export async function strReplaceInContainer(
  */
 export async function readFileFromContainer(
   filePath: string,
+  startLine?: number,
+  endLine?: number,
 ): Promise<ShellResult> {
-  return execInContainer(`cat ${shellQuote(filePath)}`);
+  if (
+    startLine == null &&
+    endLine == null
+  ) {
+    return execInContainer(`cat ${shellQuote(filePath)}`);
+  }
+
+  const script = [
+    "import sys",
+    `path = ${JSON.stringify(filePath)}`,
+    `start = ${startLine == null ? 'None' : Math.max(1, Math.floor(startLine))}`,
+    `end = ${endLine == null ? 'None' : Math.max(1, Math.floor(endLine))}`,
+    'if start is not None and end is not None and end < start:',
+    '    print("READ_FILE_ERROR: end_line must be greater than or equal to start_line", file=sys.stderr)',
+    "    sys.exit(1)",
+    'with open(path, "r", encoding="utf-8") as f:',
+    '    lines = f.readlines()',
+    'start_index = 0 if start is None else start - 1',
+    'end_index = len(lines) if end is None else end',
+    'sys.stdout.write("".join(lines[start_index:end_index]))',
+  ].join("\n");
+
+  const tmpPath = `/tmp/_read_file_${Date.now()}.py`;
+  const writeResult = await execInContainer(
+    `cat > ${tmpPath} << 'PYEOF'\n${script}\nPYEOF`,
+  );
+  if (writeResult.exitCode !== 0) {
+    return writeResult;
+  }
+  return execInContainer(`python3 ${tmpPath} && rm -f ${tmpPath}`);
 }
 
 export async function listFilesInContainer(
@@ -376,7 +429,7 @@ async function containerHasSecretsMount(): Promise<boolean> {
       '-f',
       '{{range .Mounts}}{{println .Destination}}{{end}}',
       CONTAINER_NAME,
-    ]);
+    ], { quiet: true, quietOnError: true });
     return result.stdout.split(/\r?\n/).some((line) => line.trim() === '/run/openforge');
   } catch {
     return false;
@@ -417,6 +470,15 @@ async function applyGitIdentityInContainer(): Promise<void> {
     `git config --global user.name ${shellQuote(githubAuth.username)} && ` +
       `git config --global user.email ${shellQuote(githubAuth.email)}`,
   );
+
+  if (githubAuth?.token) {
+    await execInContainer(
+      `echo ${shellQuote(githubAuth.token)} | gh auth login --with-token 2>/dev/null || true`,
+    );
+    await execInContainer(
+      `git config --global url.${JSON.stringify(`https://x-access-token:${githubAuth.token}@github.com/`)}.insteadOf ${JSON.stringify('https://github.com/')}`,
+    );
+  }
 }
 
 export async function syncRuntimeSecretsToContainer(): Promise<void> {
@@ -554,6 +616,43 @@ export async function insertAtLineInContainer(
   ].join("\n");
 
   const tmpPath = `/tmp/_insert_line_${Date.now()}.py`;
+  await execInContainer(`cat > ${tmpPath} << 'PYEOF'\n${script}\nPYEOF`);
+  return execInContainer(`python3 ${tmpPath} && rm -f ${tmpPath}`);
+}
+
+/**
+ * Delete a block from a file using deterministic anchor text.
+ * Removes everything from the first occurrence of startAnchor up to the first
+ * occurrence of endAnchor after it. endAnchor is also removed.
+ */
+export async function deleteBlockInContainer(
+  filePath: string,
+  startAnchor: string,
+  endAnchor: string,
+): Promise<ShellResult> {
+  const script = [
+    "import sys",
+    `path = ${JSON.stringify(filePath)}`,
+    `start_anchor = ${JSON.stringify(startAnchor)}`,
+    `end_anchor = ${JSON.stringify(endAnchor)}`,
+    'with open(path, "r", encoding="utf-8") as f:',
+    "    content = f.read()",
+    "start_index = content.find(start_anchor)",
+    "if start_index == -1:",
+    '    print("DELETE_BLOCK_ERROR: start_anchor not found", file=sys.stderr)',
+    "    sys.exit(1)",
+    "end_index = content.find(end_anchor, start_index + len(start_anchor))",
+    "if end_index == -1:",
+    '    print("DELETE_BLOCK_ERROR: end_anchor not found", file=sys.stderr)',
+    "    sys.exit(1)",
+    "end_index += len(end_anchor)",
+    "new_content = content[:start_index] + content[end_index:]",
+    'with open(path, "w", encoding="utf-8") as f:',
+    "    f.write(new_content)",
+    'print(f"DELETE_BLOCK_OK: removed block from {path}")',
+  ].join("\n");
+
+  const tmpPath = `/tmp/_delete_block_${Date.now()}.py`;
   await execInContainer(`cat > ${tmpPath} << 'PYEOF'\n${script}\nPYEOF`);
   return execInContainer(`python3 ${tmpPath} && rm -f ${tmpPath}`);
 }

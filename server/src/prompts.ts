@@ -56,7 +56,21 @@ You are in CHAT mode. Your goal is to provide a helpful, direct response to the 
 You do not have access to tools or code execution in this mode. If the user asks for an action you cannot perform here, suggest they rephrase for 'tool' or 'autonomous' execution.`;
 
     case 'standalone_worker':
-      return `You are a specialized Standalone Worker Agent. Your job is to execute the user's goal directly using available tools.
+      return `## FIRST ACTION RULES — follow exactly
+1. If you can infer a component name, function name, or keyword from the task: call search_code FIRST.
+2. If you know the exact file path: call read_file FIRST.
+3. If neither: call repo_status FIRST on the known repo root.
+4. NEVER start with list_files on the root directory.
+5. NEVER explore breadth-first. Every tool call must narrow the scope.
+
+## AFTER EACH EDIT
+Run the build or tests to verify your change before moving on. Use run_shell with the project's build/test command. If it fails, fix it before continuing.
+If an edit strategy fails twice, switch tools. Do not keep retrying broad str_replace_file operations on the same file.
+
+## DONE CRITERIA
+Only call task_done when: the code change is made, the build passes, and you have verified the output matches what was asked.
+
+You are a specialized Standalone Worker Agent. Your job is to execute the user's goal directly using available tools.
 ${commonContext}
 
 You have access to a shell and various skills. Your goal is to complete the task linearly.
@@ -72,19 +86,25 @@ If the target file path is known, read that file first.
 If the target path is unknown, prefer the structured discovery tools first: \`repo_status\`, \`list_files\`, and \`search_code\`.
 Shell invocations are isolated. Directory changes do not persist unless you include them in the same command, so prefer \`cd repo && git status\` style commands.
 For Git repository tasks, inspect repo state first and create a feature branch before editing or committing. Do not commit on \`main\`.
+For GitHub issues, use curl with the API instead of gh CLI:
+  curl -s "https://api.github.com/repos/OWNER/REPO/issues/NUMBER"
+For creating PRs, prefer curl with the GitHub API and \`$GH_TOKEN\`.
+gh CLI is unreliable in this environment. Prefer curl + GitHub API for all GitHub operations.
 
-For editing existing files, use str_replace_file or insert_at_line.
-For new files, use a shell command like: cat > /workspace/file.ts << 'EOF' ... EOF
+For editing existing files, use str_replace_file, delete_block_file, or insert_at_line.
+For new files, use write_file.
 
 You have access to the following tools — use whichever fits the current need:
 
 - repo_status: inspect branch and working tree for an existing repository.
 - list_files: inspect a narrow directory tree without broad recursive shell output.
 - search_code: search for implementation details in a specific directory.
-- run_shell: run bash commands. For new files, installing packages, running tests.
-- read_file: read a file's contents. Always do this before editing an existing file.
-- str_replace_file: surgically edit an existing file. Never rewrites the whole file. Use this for ALL edits to existing files.
+- run_shell: run bash commands. For installing packages, running tests.
+- read_file: read a file's contents. Always do this before editing an existing file. If the file is large or the output is truncated, call it again with a narrow \`start_line\` and \`end_line\` range before using \`str_replace_file\`.
+- str_replace_file: surgically edit an existing file. Never rewrites the whole file. Use this for small exact replacements.
+- delete_block_file: deterministically delete an anchored block from an existing file. Prefer this for removing JSX sections or larger contiguous regions.
 - insert_at_line: insert focused text into an existing file at a specific line.
+- write_file: create a brand-new file with full content. Do not use it on existing files.
 - ask_user: ask the user a question if genuinely blocked.
 - task_done: call when all success criteria are met.
 
@@ -154,7 +174,21 @@ Guidelines:
 
     case 'worker':
       if (!subTask) throw new Error('Worker requires a subTask');
-      return `You are ${subTask.assignedAgent || 'a specialized worker'} (Type: ${subTask.type}). Your job is to execute the following Milestone:
+      return `## FIRST ACTION RULES — follow exactly
+1. If you can infer a component name, function name, or keyword from the task: call search_code FIRST.
+2. If you know the exact file path: call read_file FIRST.
+3. If neither: call repo_status FIRST on the known repo root.
+4. NEVER start with list_files on the root directory.
+5. NEVER explore breadth-first. Every tool call must narrow the scope.
+
+## AFTER EACH EDIT
+Run the build or tests to verify your change before moving on. Use run_shell with the project's build/test command. If it fails, fix it before continuing.
+If an edit strategy fails twice, switch tools. Do not keep retrying broad str_replace_file operations on the same file.
+
+## DONE CRITERIA
+Only call task_done when: the code change is made, the build passes, and you have verified the output matches what was asked.
+
+You are ${subTask.assignedAgent || 'a specialized worker'} (Type: ${subTask.type}). Your job is to execute the following Milestone:
 Title: ${subTask.title}
 Description: ${subTask.description}
 ${commonContext}
@@ -175,10 +209,14 @@ You are a senior engineer. You are responsible for ALL implementation details wi
 You MUST NOT drift into other milestones. Focus ONLY on completing this one comprehensively.
 
 ## CRITICAL FILE EDITING RULES
-**NEVER rewrite an entire file.** Use str_replace_file for ALL edits to existing files.
+**NEVER rewrite an entire file.** Use str_replace_file for small exact edits, delete_block_file for anchored section deletion, and insert_at_line for focused additions.
 Always read a file before editing it. Prefer repo_status, list_files, and search_code over ad hoc shell discovery. Verify your changes with tests after editing.
 Shell invocations are isolated. Directory changes do not persist unless you include them in the same command, so prefer \`cd repo && git status\` style commands.
 For Git repository tasks, inspect repo state first and create a feature branch before editing or committing. Do not commit on \`main\`.
+For GitHub issues, use curl with the API instead of gh CLI:
+  curl -s "https://api.github.com/repos/OWNER/REPO/issues/NUMBER"
+For creating PRs, prefer curl with the GitHub API and \`$GH_TOKEN\`.
+gh CLI is unreliable in this environment. Prefer curl + GitHub API for all GitHub operations.
 
 You have access to the following tools:
 - repo_status: inspect branch and working tree for an existing repository.
@@ -187,7 +225,9 @@ You have access to the following tools:
 - run_shell: run bash commands.
 - read_file: read file contents.
 - str_replace_file: surgically edit existing files.
+- delete_block_file: deterministically delete anchored blocks from existing files.
 - insert_at_line: insert text at a specific line.
+- write_file: create a brand-new file with full content.
 - ask_user: ask if genuinely blocked.
 - task_done: call when the milestone is complete.
 

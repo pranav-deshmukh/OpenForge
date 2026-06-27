@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { v4 as uuid } from 'uuid';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { Task, MemoryEntry, SubTask, Reflection, Artifact, MemoryLayer } from './types.js';
+import type { Task, MemoryEntry, SubTask, Reflection, Artifact, MemoryLayer, Message } from './types.js';
 
 let ioInstance: any = null;
 export function setIo(io: any) {
@@ -470,8 +470,43 @@ function appendToVault(entry: MemoryEntry) {
 }
 
 export function compressContext(content: string): string {
-  return content
-    .replace(/\s+/g, ' ')
+  const cleaned = content
     .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .replace(/[ \t]+$/gm, '')
     .trim();
+  if (cleaned.length > 4000) {
+    return cleaned.slice(0, 2000) + `\n\n[... ${cleaned.length - 2500} chars truncated ...]\n\n` + cleaned.slice(-500);
+  }
+  return cleaned;
+}
+
+export function summarizeConversationHistory(history: Message[], keepRecent = 20): Message[] {
+  if (history.length <= keepRecent) return history;
+  const old = history.slice(0, history.length - keepRecent);
+  const recent = history.slice(history.length - keepRecent);
+
+  const filesRead = new Set<string>();
+  const filesEdited = new Set<string>();
+  let commandsSucceeded = 0;
+  let errorCount = 0;
+
+  for (const msg of old) {
+    if (msg.role !== 'user') continue;
+    const readMatch = msg.content.match(/Contents of ([^\n:]+):/);
+    if (readMatch) filesRead.add(readMatch[1]);
+    const editMatch = msg.content.match(/str_replace result \(exit 0\)|write_file result \(exit 0\)/);
+    if (editMatch) filesEdited.add(msg.content.slice(0, 60));
+    if (msg.content.includes('exit 0')) commandsSucceeded++;
+    if (msg.content.includes('exit 1') || msg.content.toLowerCase().includes('error')) errorCount++;
+  }
+
+  const summary = [
+    `## Prior work summary (${old.length} turns compressed)`,
+    filesRead.size > 0 ? `Files already read: ${[...filesRead].join(', ')}` : '',
+    filesEdited.size > 0 ? `Edits made: ${filesEdited.size} file(s)` : '',
+    `Commands succeeded: ${commandsSucceeded} | Errors: ${errorCount}`,
+    'Do not re-read files already listed above unless re-checking after an edit.',
+  ].filter(Boolean).join('\n');
+
+  return [{ role: 'user', content: summary }, ...recent];
 }

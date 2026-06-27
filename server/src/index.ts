@@ -340,4 +340,13 @@ httpServer.listen(PORT, () => {
   recoverInterruptedTasks();
   console.log(`[Server] Running on http://localhost:${PORT}`);
   startQueueWorker(5000);
+  void (async () => {
+    try {
+      await ensureWorkspaceReady();
+      await syncRuntimeSecretsToContainer();
+      console.log('[Server] Workspace ready');
+    } catch (error) {
+      console.error('[Server] Failed to initialize workspace:', error);
+    }
+  })();
 });

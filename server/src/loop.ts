@@ -4,6 +4,7 @@ import {
   ensureWorkspaceReady,
   execInContainer,
   strReplaceInContainer,
+  deleteBlockInContainer,
   readFileFromContainer,
   listFilesInContainer,
   searchCodeInContainer,
@@ -11,13 +12,14 @@ import {
   insertAtLineInContainer,
   pathExistsInContainer,
   getPreinstalledPackages,
+  syncRuntimeSecretsToContainer,
 } from "./shell.js";
 // Skills are loaded dynamically in future — not injected statically
 import { 
   saveMemory, updateTask, getTask, getMemoryForTask, 
   createSubTask, updateSubTask, getSubTasksForTask, getSubTask,
   createArtifact, getArtifactsForTask, createReflection,
-  getMemoryForSubTask, compressContext, incrementTaskIterations
+  getMemoryForSubTask, compressContext, incrementTaskIterations, summarizeConversationHistory
 } from './memory.js';
 import {
   clearAgentAssignment,
@@ -67,6 +69,7 @@ const MAX_TOTAL_AGENT_STEPS_RESEARCH = parsePositiveIntEnv(
 const MAX_REPLAN_ATTEMPTS = 2;
 const MAX_RETRIES_PER_TASK = 2;
 const MAX_TOOL_OUTPUT_CHARS = 12000;
+const MAX_STR_REPLACE_FAILURES_PER_FILE = 2;
 
 function getEffectiveAgentMode(task: Task): AgentMode {
   return task.agentMode === 'RESEARCH' ? 'RESEARCH' : 'FAST';
@@ -152,6 +155,31 @@ async function buildRepoContextMessage(task: Task, subTask?: SubTask): Promise<s
   ].join('\n');
 }
 
+async function buildRepoFingerprint(repoRoot: string): Promise<string> {
+  const parts: string[] = [`Repo root: ${repoRoot}`];
+
+  for (const manifest of ['package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml']) {
+    const r = await readFileFromContainer(`${repoRoot}/${manifest}`);
+    if (r.exitCode === 0 && r.stdout.trim()) {
+      parts.push(`## ${manifest}\n${r.stdout.slice(0, 800)}`);
+      break;
+    }
+  }
+
+  const tree = await listFilesInContainer(repoRoot, 2);
+  if (tree.stdout) parts.push(`## Directory structure (depth 2)\n${tree.stdout.slice(0, 1500)}`);
+
+  for (const guide of ['AGENTS.md', 'CLAUDE.md', '.cursorrules', 'CONTRIBUTING.md']) {
+    const r = await readFileFromContainer(`${repoRoot}/${guide}`);
+    if (r.exitCode === 0 && r.stdout.trim()) {
+      parts.push(`## ${guide}\n${r.stdout.slice(0, 1200)}`);
+      break;
+    }
+  }
+
+  return parts.join('\n\n');
+}
+
 function isTaskCancelled(taskId: string): boolean {
   return getTask(taskId)?.status === 'cancelled';
 }
@@ -182,7 +210,9 @@ async function waitForUserInput(
       : getMemoryForTask(taskId);
     const newInputs = entries.filter((m) => m.type === 'input' && m.createdAt > lastProcessedInputTime);
     if (newInputs.length > 0) {
-      return Math.max(...newInputs.map((m) => m.createdAt), lastProcessedInputTime);
+      // Return the previous watermark so the caller's next loop iteration
+      // actually ingests the input that woke the wait.
+      return lastProcessedInputTime;
     }
   }
 }
@@ -204,6 +234,23 @@ function heuristicRouteTask(goal: string): Task['mode'] | null {
   ) {
     return 'autonomous_dag';
   }
+
+  if (
+    /(github\.com|issue|fix|bug)\b/.test(text) &&
+    /(frontend|css|tsx?|jsx?|component|style|ui)\b/.test(text)
+  ) {
+    return 'tool';
+  }
+
+  // Short focused repo tasks go to tool mode — don't spin up the full DAG
+  const wordCount = text.split(/\s+/).length;
+  const isSmallRepoTask =
+    wordCount < 50 &&
+    /(github\.com|repo|repository|codebase)\b/.test(text) &&
+    /(fix|update|change|edit|add|remove|refactor|debug)\b/.test(text) &&
+    !/(build|create|implement|full.stack|entire|whole|new (app|project|service|system))/.test(text);
+
+  if (isSmallRepoTask) return 'tool';
 
   if (
     /(github\.com|issue\s*#?\d+|pull request|\bpr\b|repo\b|repository\b|codebase\b|local repo\b)/.test(text) &&
@@ -376,6 +423,45 @@ async function findExistingFileOverwriteTarget(command: string): Promise<string 
   return null;
 }
 
+const SAFE_DEV_COMMANDS = [
+  /^git /,
+  /^npm /,
+  /^node /,
+  /^npx /,
+  /^yarn /,
+  /^pnpm /,
+  /^cat /,
+  /^ls /,
+  /^find /,
+  /^rg /,
+  /^grep /,
+  /^wc /,
+  /^mkdir /,
+  /^cp /,
+  /^mv /,
+  /^touch /,
+  /^echo /,
+  /^tsc /,
+  /^eslint /,
+  /^prettier /,
+  /^jest /,
+  /^vitest /,
+  /^python3? /,
+  /^pip3? /,
+  /^poetry /,
+  /^cargo /,
+  /^go /,
+  /^cd /,
+  /^pwd /,
+  /^which /,
+  /^env /,
+  /^export /,
+];
+
+function isObviouslySafe(command: string): boolean {
+  return SAFE_DEV_COMMANDS.some((pattern) => pattern.test(command.trim()));
+}
+
 function truncateToolOutput(output: string, limit = MAX_TOOL_OUTPUT_CHARS): string {
   if (output.length <= limit) return output;
   const omitted = output.length - limit;
@@ -392,12 +478,12 @@ function maybeUpdateWorkingDirectory(currentDirectory: string | null, command: s
     return currentDirectory;
   }
 
-  const match = command.match(/^\s*cd\s+([^\s;&|]+)\s*(?:&&|$)/);
+  const match = command.match(/^\s*cd\s+(".*?"|'.*?'|[^\s;&|]+)\s*(?:&&|$)/);
   if (!match) {
     return currentDirectory;
   }
 
-  const nextDirectory = match[1]?.trim();
+  const nextDirectory = unquoteShellPath(match[1] ?? '');
   if (!nextDirectory) {
     return currentDirectory;
   }
@@ -414,6 +500,9 @@ function applyWorkingDirectory(command: string, currentDirectory: string | null)
   if (!currentDirectory) {
     return command;
   }
+  if (command.trim().startsWith('cd ')) {
+    return command;
+  }
   return `cd ${JSON.stringify(currentDirectory)} && ${command}`;
 }
 
@@ -428,6 +517,54 @@ function buildRepeatCommandFeedback(command: string, replay: CommandReplay): str
     `Do not repeat the same shell command unless new information changes the situation.\n` +
     `Previous output:\n${replay.output}\n\n` +
     'Use that result and choose a narrower next step.'
+  );
+}
+
+function isCdPathFailure(command: string, result: { exitCode: number; stdout: string; stderr: string }): boolean {
+  if (result.exitCode === 0) {
+    return false;
+  }
+  if (!command.trim().startsWith('cd ')) {
+    return false;
+  }
+  const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return output.includes('no such file or directory');
+}
+
+function isDependencyEnvironmentFailure(output: string): boolean {
+  const normalized = output.toLowerCase();
+  return (
+    normalized.includes('cannot find module') &&
+    (
+      normalized.includes('node_modules') ||
+      normalized.includes('abort-controller.js.text.js')
+    )
+  );
+}
+
+function getBuildFailureFeedback(output: string): string {
+  if (isDependencyEnvironmentFailure(output)) {
+    return (
+      'Build verification hit a broken dependency environment rather than a code change regression. ' +
+      'Do not spend more turns trying to repair node_modules unless the task explicitly asks for environment repair. ' +
+      `Proceed using other evidence and note this environment issue in the final summary.\n\n${output}`
+    );
+  }
+
+  return `Build verification failed. Fix these errors before calling task_done:\n\n${output}`;
+}
+
+function getStrReplaceFailureFeedback(file: string, failures: number): string {
+  if (failures < MAX_STR_REPLACE_FAILURES_PER_FILE) {
+    return (
+      `str_replace_file failed for ${file}. Re-read a narrower range and try once more with exact current text. ` +
+      'If the edit is a section deletion or larger JSX block change, prefer delete_block_file instead of another broad replacement.'
+    );
+  }
+
+  return (
+    `str_replace_file has failed ${failures} times for ${file}. Stop retrying exact-text replacement on this file. ` +
+    'Use delete_block_file for anchored block deletion, insert_at_line for focused additions, or a narrower, deterministic edit strategy.'
   );
 }
 
@@ -488,7 +625,8 @@ async function runToolMode(task: Task) {
     note: 'Executing linear tool task',
   });
   await ensureWorkspaceReady();
-  
+  await syncRuntimeSecretsToContainer();
+
   const preinstalled = await getPreinstalledPackages();
   const repoContext = await buildRepoContextMessage(task);
   const envContext = `
@@ -503,20 +641,46 @@ If you need a package NOT in the above list, install it normally. It will persis
 
   const systemPrompt = getSystemPrompt('standalone_worker', { task });
   const conversationHistory: Message[] = [{ role: 'user', content: envContext }];
+  const repoRoot = await resolveKnownRepoRoot(task);
+  let currentWorkingDirectory: string | null = repoRoot;
   if (repoContext) {
     conversationHistory.push({ role: 'user', content: repoContext });
+  }
+  if (currentWorkingDirectory) {
+    const fingerprint = await buildRepoFingerprint(currentWorkingDirectory);
+    if (fingerprint) {
+      conversationHistory.push({
+        role: 'user',
+        content: `## Codebase Context\n${fingerprint}`,
+      });
+    }
+  }
+  if (repoRoot) {
+    for (const file of ['AGENTS.md', 'CLAUDE.md', '.cursorrules']) {
+      const result = await readFileFromContainer(`${repoRoot}/${file}`);
+      if (result.exitCode === 0 && result.stdout) {
+        conversationHistory.push({
+          role: 'user',
+          content: `Repo instructions from ${file}:\n${result.stdout}`,
+        });
+      }
+    }
   }
   conversationHistory.push({ role: 'user', content: task.goal });
 
   // Initialize with task createdAt - 1 to catch very early inputs
   let lastProcessedInputTime = task.createdAt - 1;
-  let currentWorkingDirectory: string | null = await resolveKnownRepoRoot(task);
   const previousShellResults = new Map<string, CommandReplay>();
+  let failedCdCommandCount = 0;
+  const strReplaceFailuresByFile = new Map<string, number>();
 
   for (let i = 1; i <= maxIterations; i++) {
     if (isTaskCancelled(task.id)) {
       clearAgentAssignment('Forge');
       return;
+    }
+    if (i > 0 && i % 20 === 0) {
+      conversationHistory.splice(0, conversationHistory.length, ...summarizeConversationHistory(conversationHistory, 20));
     }
     incrementTaskIterations(task.id);
 
@@ -572,6 +736,16 @@ If you need a package NOT in the above list, install it normally. It will persis
     // ── Dispatch tool calls ──────────────────────────────────────────────────
 
     if (toolCall.name === 'task_done') {
+      if (currentWorkingDirectory) {
+        const buildCheck = await runBuildVerification(currentWorkingDirectory);
+        if (!buildCheck.passed) {
+          conversationHistory.push({
+            role: 'user',
+            content: getBuildFailureFeedback(buildCheck.output),
+          });
+          continue;
+        }
+      }
       const { summary } = toolCall.args;
       if (!isTaskCancelled(task.id)) {
         updateTask(task.id, { status: 'done', completedAt: Date.now(), result: summary || 'Task completed via Tool mode.' });
@@ -618,22 +792,61 @@ If you need a package NOT in the above list, install it normally. It will persis
     }
 
     if (toolCall.name === 'read_file') {
-      const { path } = toolCall.args;
-      saveMemory(task.id, 'command', `[read_file] ${path}`, null, 'working');
-      const result = await readFileFromContainer(path);
+      const { path, start_line, end_line } = toolCall.args;
+      const rangeSuffix =
+        start_line != null || end_line != null
+          ? ` lines=${start_line ?? 1}-${end_line ?? 'EOF'}`
+          : '';
+      saveMemory(task.id, 'command', `[read_file] ${path}${rangeSuffix}`, null, 'working');
+      const result = await readFileFromContainer(path, start_line, end_line);
       const output = truncateToolOutput(result.stdout || '(empty file)');
       saveMemory(task.id, 'output', output, null, 'working');
-      conversationHistory.push({ role: 'user', content: `Contents of ${path}:\n${output}` });
+      const label =
+        start_line != null || end_line != null
+          ? `Contents of ${path} (lines ${start_line ?? 1}-${end_line ?? 'EOF'}):`
+          : `Contents of ${path}:`;
+      const truncationWarning = output.includes('[output truncated:')
+        ? '\nIf you need exact edit context from a large file, call read_file again with start_line and end_line for a narrow range.'
+        : '';
+      conversationHistory.push({ role: 'user', content: `${label}\n${output}${truncationWarning}` });
       continue;
     }
 
     if (toolCall.name === 'str_replace_file') {
       const { file, old_str, new_str } = toolCall.args;
+      const failureCount = strReplaceFailuresByFile.get(file) ?? 0;
+      if (failureCount >= MAX_STR_REPLACE_FAILURES_PER_FILE) {
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, failureCount),
+        });
+        continue;
+      }
       saveMemory(task.id, 'command', `[str_replace] ${file}`, null, 'working');
       const result = await strReplaceInContainer(file, old_str, new_str);
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      if (result.exitCode === 0) {
+        strReplaceFailuresByFile.delete(file);
+      } else {
+        const nextFailures = failureCount + 1;
+        strReplaceFailuresByFile.set(file, nextFailures);
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, nextFailures),
+        });
+      }
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
       conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'delete_block_file') {
+      const { file, start_anchor, end_anchor } = toolCall.args;
+      saveMemory(task.id, 'command', `[delete_block] ${file}`, null, 'working');
+      const result = await deleteBlockInContainer(file, start_anchor, end_anchor);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `delete_block result (exit ${result.exitCode}):\n${output}` });
       continue;
     }
 
@@ -644,6 +857,27 @@ If you need a package NOT in the above list, install it normally. It will persis
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
       conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'write_file') {
+      const { path: filePath, content } = toolCall.args;
+      saveMemory(task.id, 'command', `[write_file] ${filePath}`, null, 'working');
+
+      if (await pathExistsInContainer(filePath)) {
+        conversationHistory.push({ role: 'user', content: `File ${filePath} already exists. Use str_replace_file to edit it.` });
+        continue;
+      }
+
+      const dir = filePath.split('/').slice(0, -1).join('/');
+      if (dir) await execInContainer(`mkdir -p ${JSON.stringify(dir)}`);
+
+      const b64 = Buffer.from(content, 'utf8').toString('base64');
+      const result = await execInContainer(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(filePath)}`);
+      const output = result.exitCode === 0 ? `File created: ${filePath}` : (result.stdout + result.stderr).slice(0, 500);
+
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `write_file (exit ${result.exitCode}): ${output}` });
       continue;
     }
 
@@ -664,8 +898,8 @@ If you need a package NOT in the above list, install it normally. It will persis
         continue;
       }
 
-      // Security Audit
-      const isSafe = await runSecurityAudit(task, command, { title: 'Tool Execution' } as any);
+      const isSafe =
+        isObviouslySafe(command) || (await runSecurityAudit(task, command, { title: 'Tool Execution' } as any));
       if (!isSafe) {
         saveMemory(task.id, 'security_alert', `Blocked command: ${command}`, null, 'working');
         conversationHistory.push({ role: 'user', content: 'That command is blocked by the security policy. Please use a safer alternative.' });
@@ -687,14 +921,32 @@ If you need a package NOT in the above list, install it normally. It will persis
       const result = await execInContainer(effectiveCommand);
       currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
-      previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
+      if (isCdPathFailure(command, result)) {
+        failedCdCommandCount++;
+        conversationHistory.push({
+          role: 'user',
+          content: 'Shell error: cd failed. Do not retry this path. Use absolute paths directly or re-discover the repo root before running more commands.',
+        });
+        if (failedCdCommandCount > 3) {
+          conversationHistory.push({
+            role: 'user',
+            content: 'Too many consecutive cd failures. Re-read the task and restart from the repo root instead of chaining cd commands.',
+          });
+          failedCdCommandCount = 0;
+        }
+      } else if (result.exitCode === 0) {
+        failedCdCommandCount = 0;
+      }
+      if (result.exitCode === 0) {
+        previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
+      }
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
       conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
       continue;
     }
 
     // Unknown tool
-    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, delete_block_file, insert_at_line, write_file, ask_user, task_done.` });
   }
 
   if (!isTaskCancelled(task.id)) {
@@ -1083,7 +1335,7 @@ const WORKER_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'run_shell',
-    description: 'Run a bash command in the Docker workspace container. Use for: creating new files, installing packages, running tests, starting servers, listing directories, checking git status. Do NOT use for editing existing files — use str_replace_file instead.',
+    description: 'Run a bash command in the Docker workspace container. Use for: installing packages, running tests, starting servers, listing directories, checking git status. Do NOT use for editing existing files — use str_replace_file instead.',
     parameters: {
       type: 'object',
       properties: {
@@ -1097,13 +1349,21 @@ const WORKER_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'read_file',
-    description: 'Read the full contents of a file inside the container. Always call this before editing an existing file so you have the exact current text.',
+    description: 'Read a file inside the container. For large files, request a targeted line range so you have exact edit context without truncation.',
     parameters: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
           description: 'Absolute path to the file inside the container, e.g. /workspace/src/index.ts'
+        },
+        start_line: {
+          type: 'number',
+          description: 'Optional 1-based starting line. Use this for large files when you only need a specific region.'
+        },
+        end_line: {
+          type: 'number',
+          description: 'Optional 1-based ending line, inclusive. Use with start_line to read an exact slice.'
         }
       },
       required: ['path']
@@ -1132,6 +1392,28 @@ const WORKER_TOOLS: ToolDefinition[] = [
     }
   },
   {
+    name: 'delete_block_file',
+    description: 'Deterministically delete a contiguous block from an existing file using start and end anchor text. Prefer this for removing JSX sections, large blocks, or exact anchored regions when str_replace_file is brittle.',
+    parameters: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          description: 'Absolute path to the file inside the container'
+        },
+        start_anchor: {
+          type: 'string',
+          description: 'Exact text that marks the start of the block to delete'
+        },
+        end_anchor: {
+          type: 'string',
+          description: 'Exact text that marks the end of the block to delete. This anchor is removed too.'
+        }
+      },
+      required: ['file', 'start_anchor', 'end_anchor']
+    }
+  },
+  {
     name: 'insert_at_line',
     description: 'Insert new text at a specific 1-based line number in an existing file. Use this for focused additions like imports or a new statement inside a file without rewriting the whole file.',
     parameters: {
@@ -1152,6 +1434,18 @@ const WORKER_TOOLS: ToolDefinition[] = [
       },
       required: ['file', 'line', 'text']
     }
+  },
+  {
+    name: 'write_file',
+    description: 'Create a new file with given content. Only for NEW files that do not exist yet. For existing files use str_replace_file.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the new file inside the container' },
+        content: { type: 'string', description: 'Full file content to write' },
+      },
+      required: ['path', 'content'],
+    },
   },
   {
     name: 'ask_user',
@@ -1211,6 +1505,8 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
     note: subTask.description,
   });
   saveMemory(task.id, 'thought', `Worker starting subtask: ${subTask.title}`, subTask.id, 'working');
+  await ensureWorkspaceReady();
+  await syncRuntimeSecretsToContainer();
 
   const preinstalled = await getPreinstalledPackages();
   const repoContext = await buildRepoContextMessage(task, subTask);
@@ -1228,8 +1524,18 @@ If you need a package NOT in the above list, install it normally. It will persis
   const systemPrompt = getSystemPrompt('worker', { task, subTask, artifacts });
 
   const conversationHistory: Message[] = [{ role: 'user', content: envContext }];
+  let currentWorkingDirectory: string | null = await resolveKnownRepoRoot(task, subTask);
   if (repoContext) {
     conversationHistory.push({ role: 'user', content: repoContext });
+  }
+  if (currentWorkingDirectory) {
+    const fingerprint = await buildRepoFingerprint(currentWorkingDirectory);
+    if (fingerprint) {
+      conversationHistory.push({
+        role: 'user',
+        content: `## Codebase Context\n${fingerprint}`,
+      });
+    }
   }
   conversationHistory.push({
     role: 'user',
@@ -1239,13 +1545,17 @@ If you need a package NOT in the above list, install it normally. It will persis
   let lastProcessedInputTime = subTask.createdAt - 1;
   let consecutiveNoProgress = 0;
   let lastState = { thought: '', toolName: '', toolArgs: '' };
-  let currentWorkingDirectory: string | null = await resolveKnownRepoRoot(task, subTask);
   const previousShellResults = new Map<string, CommandReplay>();
+  let failedCdCommandCount = 0;
+  const strReplaceFailuresByFile = new Map<string, number>();
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
     if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
       clearAgentAssignment(assignedAgent);
       return;
+    }
+    if (i > 0 && i % 20 === 0) {
+      conversationHistory.splice(0, conversationHistory.length, ...summarizeConversationHistory(conversationHistory, 20));
     }
     incrementTaskIterations(task.id);
     
@@ -1321,6 +1631,16 @@ If you need a package NOT in the above list, install it normally. It will persis
     // ── Dispatch tool calls ──────────────────────────────────────────────────
 
     if (toolCall.name === 'task_done') {
+      if (currentWorkingDirectory) {
+        const buildCheck = await runBuildVerification(currentWorkingDirectory);
+        if (!buildCheck.passed) {
+          conversationHistory.push({
+            role: 'user',
+            content: getBuildFailureFeedback(buildCheck.output),
+          });
+          continue;
+        }
+      }
       const { summary, artifacts: arts = [] } = toolCall.args;
       for (const art of arts) {
         createArtifact({
@@ -1391,22 +1711,61 @@ If you need a package NOT in the above list, install it normally. It will persis
     }
 
     if (toolCall.name === 'read_file') {
-      const { path } = toolCall.args;
-      saveMemory(task.id, 'command', `[read_file] ${path}`, subTask.id, 'working');
-      const result = await readFileFromContainer(path);
+      const { path, start_line, end_line } = toolCall.args;
+      const rangeSuffix =
+        start_line != null || end_line != null
+          ? ` lines=${start_line ?? 1}-${end_line ?? 'EOF'}`
+          : '';
+      saveMemory(task.id, 'command', `[read_file] ${path}${rangeSuffix}`, subTask.id, 'working');
+      const result = await readFileFromContainer(path, start_line, end_line);
       const output = truncateToolOutput(result.stdout || '(empty file)');
       saveMemory(task.id, 'output', output, subTask.id, 'working');
-      conversationHistory.push({ role: 'user', content: `Contents of ${path}:\n${output}` });
+      const label =
+        start_line != null || end_line != null
+          ? `Contents of ${path} (lines ${start_line ?? 1}-${end_line ?? 'EOF'}):`
+          : `Contents of ${path}:`;
+      const truncationWarning = output.includes('[output truncated:')
+        ? '\nIf you need exact edit context from a large file, call read_file again with start_line and end_line for a narrow range.'
+        : '';
+      conversationHistory.push({ role: 'user', content: `${label}\n${output}${truncationWarning}` });
       continue;
     }
 
     if (toolCall.name === 'str_replace_file') {
       const { file, old_str, new_str } = toolCall.args;
+      const failureCount = strReplaceFailuresByFile.get(file) ?? 0;
+      if (failureCount >= MAX_STR_REPLACE_FAILURES_PER_FILE) {
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, failureCount),
+        });
+        continue;
+      }
       saveMemory(task.id, 'command', `[str_replace] ${file}`, subTask.id, 'working');
       const result = await strReplaceInContainer(file, old_str, new_str);
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      if (result.exitCode === 0) {
+        strReplaceFailuresByFile.delete(file);
+      } else {
+        const nextFailures = failureCount + 1;
+        strReplaceFailuresByFile.set(file, nextFailures);
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, nextFailures),
+        });
+      }
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'delete_block_file') {
+      const { file, start_anchor, end_anchor } = toolCall.args;
+      saveMemory(task.id, 'command', `[delete_block] ${file}`, subTask.id, 'working');
+      const result = await deleteBlockInContainer(file, start_anchor, end_anchor);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `delete_block result (exit ${result.exitCode}):\n${output}` });
       continue;
     }
 
@@ -1417,6 +1776,27 @@ If you need a package NOT in the above list, install it normally. It will persis
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'write_file') {
+      const { path: filePath, content } = toolCall.args;
+      saveMemory(task.id, 'command', `[write_file] ${filePath}`, subTask?.id ?? null, 'working');
+
+      if (await pathExistsInContainer(filePath)) {
+        conversationHistory.push({ role: 'user', content: `File ${filePath} already exists. Use str_replace_file to edit it.` });
+        continue;
+      }
+
+      const dir = filePath.split('/').slice(0, -1).join('/');
+      if (dir) await execInContainer(`mkdir -p ${JSON.stringify(dir)}`);
+
+      const b64 = Buffer.from(content, 'utf8').toString('base64');
+      const result = await execInContainer(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(filePath)}`);
+      const output = result.exitCode === 0 ? `File created: ${filePath}` : (result.stdout + result.stderr).slice(0, 500);
+
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask?.id ?? null, 'working');
+      conversationHistory.push({ role: 'user', content: `write_file (exit ${result.exitCode}): ${output}` });
       continue;
     }
 
@@ -1454,8 +1834,7 @@ If you need a package NOT in the above list, install it normally. It will persis
         continue;
       }
 
-      // LLM security audit as second layer
-      const isSafe = await runSecurityAudit(task, command, subTask);
+      const isSafe = isObviouslySafe(command) || (await runSecurityAudit(task, command, subTask));
       if (!isSafe) {
         saveMemory(task.id, 'security_alert', `Security audit blocked: ${command}`, subTask.id, 'working');
         conversationHistory.push({ role: 'user', content: 'Security Audit FAILED: command blocked. Please suggest an alternative approach.' });
@@ -1477,14 +1856,32 @@ If you need a package NOT in the above list, install it normally. It will persis
       const result = await execInContainer(effectiveCommand, 600000);
       currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
       const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
-      previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
+      if (isCdPathFailure(command, result)) {
+        failedCdCommandCount++;
+        conversationHistory.push({
+          role: 'user',
+          content: 'Shell error: cd failed. Do not retry this path. Use absolute paths directly or re-discover the repo root before running more commands.',
+        });
+        if (failedCdCommandCount > 3) {
+          conversationHistory.push({
+            role: 'user',
+            content: 'Too many consecutive cd failures. Re-read the task and restart from the repo root instead of chaining cd commands.',
+          });
+          failedCdCommandCount = 0;
+        }
+      } else if (result.exitCode === 0) {
+        failedCdCommandCount = 0;
+      }
+      if (result.exitCode === 0) {
+        previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
+      }
       saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
       conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
       continue;
     }
 
     // Unknown tool - tell the model
-    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, insert_at_line, ask_user, task_done.` });
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, delete_block_file, insert_at_line, write_file, ask_user, task_done.` });
   }
 
   if (!isTaskCancelled(task.id) && !isSubTaskCancelled(subTask.id)) {
@@ -1515,6 +1912,30 @@ async function runSecurityAudit(task: Task, command: string, subTask: SubTask): 
     clearAgentAssignment('Sentry');
     return false; // Default to unsafe on error
   }
+}
+
+async function runBuildVerification(repoRoot: string): Promise<{ passed: boolean; output: string }> {
+  const pkgResult = await readFileFromContainer(`${repoRoot}/package.json`);
+  if (pkgResult.exitCode !== 0) return { passed: true, output: '' };
+
+  let pkg: any = {};
+  try { pkg = JSON.parse(pkgResult.stdout); } catch { return { passed: true, output: '' }; }
+
+  const scripts = pkg.scripts || {};
+  const tryScript = async (name: string) => {
+    const r = await execInContainer(`cd ${JSON.stringify(repoRoot)} && npm run ${name} 2>&1 | tail -40`, 120000);
+    return r;
+  };
+
+  if (scripts.build) {
+    const r = await tryScript('build');
+    if (r.exitCode !== 0) return { passed: false, output: `Build failed:\n${r.stdout + r.stderr}` };
+  } else {
+    const r = await execInContainer(`cd ${JSON.stringify(repoRoot)} && npx tsc --noEmit 2>&1 | tail -30`, 60000);
+    if (r.exitCode !== 0) return { passed: false, output: `TypeScript errors:\n${r.stdout + r.stderr}` };
+  }
+
+  return { passed: true, output: 'Build passed.' };
 }
 
 async function verifySubTask(task: Task, subTask: SubTask): Promise<boolean> {
