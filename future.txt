@@ -1,0 +1,33 @@
+Latency Reduction Plan
+
+1. Reduce LLM turns per task.
+- Batch more work into each model step where possible.
+- Avoid search -> read -> think -> tool patterns when one tighter step can do the same job.
+- Main goal: increase progress per turn.
+
+2. Stop preloading repo context unless the task actually needs it.
+- Avoid always reading manifests, tree snapshots, and repo guidance files up front.
+- Load repo fingerprint data lazily after the first edit/search decision requires it.
+- Main goal: cut startup overhead before the first useful action.
+
+3. Avoid paying Docker exec cost for every tiny file operation.
+- Current read/search/edit helpers all cross the Docker boundary separately.
+- Consider fewer, larger operations or a longer-lived helper process inside the container.
+- Main goal: reduce fixed per-tool-call overhead.
+
+4. Make verification selective based on task size and risk.
+- Small scoped edits should not always trigger the heaviest possible build/install flow.
+- Prefer lint/typecheck/targeted verification for narrow UI edits when appropriate.
+- Main goal: avoid spending most of the runtime after the actual fix is already done.
+
+5. Route more GitHub repo edits into the lightweight execution path.
+- Simple "fix issue and open PR" work should prefer tool mode, not the heavier autonomous DAG path.
+- Keep the full orchestrator for genuinely multi-step or cross-cutting tasks.
+- Main goal: match Copilot/Codex-style direct execution for small repo tasks.
+
+Expected impact ranking
+1. Reduce LLM turns per task
+2. Lazy-load repo context
+3. Reduce Docker exec overhead
+4. Selective verification
+5. Better routing to lightweight mode
