@@ -145,40 +145,6 @@ try {
   db.exec(`ALTER TABLE memory ADD COLUMN metadata TEXT`);
 } catch {}
 
-// Agent persistent knowledge table
-db.exec(`
-  CREATE TABLE IF NOT EXISTS agent_knowledge (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    key TEXT NOT NULL UNIQUE,
-    content TEXT NOT NULL,
-    updatedAt INTEGER NOT NULL
-  );
-`);
-
-// ── Agent Knowledge CRUD ─────────────────────────────────────────────────────
-
-export function getAgentKnowledge(key: string): string | null {
-  const row = db.prepare('SELECT content FROM agent_knowledge WHERE key = ?').get(key) as any;
-  return row ? row.content : null;
-}
-
-export function listAgentKnowledge(): { key: string; content: string; updatedAt: number }[] {
-  return db.prepare('SELECT key, content, updatedAt FROM agent_knowledge ORDER BY updatedAt DESC').all() as any[];
-}
-
-export function setAgentKnowledge(key: string, content: string): void {
-  db.prepare(`
-    INSERT INTO agent_knowledge (key, content, updatedAt)
-    VALUES (?, ?, ?)
-    ON CONFLICT(key) DO UPDATE SET content = excluded.content, updatedAt = excluded.updatedAt
-  `).run(key, content, Date.now());
-}
-
-export function deleteAgentKnowledge(key: string): boolean {
-  const r = db.prepare('DELETE FROM agent_knowledge WHERE key = ?').run(key);
-  return r.changes > 0;
-}
-
 // Helpers
 function fromDbSubTask(row: any): SubTask {
   return {

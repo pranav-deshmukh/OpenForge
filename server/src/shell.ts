@@ -53,12 +53,14 @@ async function imageExists(imageName: string): Promise<boolean> {
 
 export async function execInContainer(
   command: string,
-  timeoutMs = 60000
+  timeoutMs = 60000,
+  workDir?: string
 ): Promise<ShellResult> {
   return new Promise((resolve) => {
-    const proc = spawn('docker', [
-      'exec', '-i', CONTAINER_NAME, 'bash', '-lc', withRuntimeEnv(command)
-    ]);
+    const args = ['exec', '-i'];
+    if (workDir) args.push('-w', workDir);
+    args.push(CONTAINER_NAME, 'bash', '-lc', withRuntimeEnv(command));
+    const proc = spawn('docker', args);
 
     let stdout = '';
     let stderr = '';
@@ -130,7 +132,7 @@ export async function ensureWorkspaceReady(): Promise<void> {
   // 3. Build image if missing
   console.log(`[Shell] Workspace image not found. Building...`);
 
-  const dockerfile = `FROM ubuntu:22.04
+    const dockerfile = `FROM node:22-bookworm
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
@@ -146,13 +148,6 @@ RUN apt-get update && apt-get install -y \\
     ripgrep fd-find \\
     && rm -rf /var/lib/apt/lists/*
 
-# Install a current Node.js runtime instead of Ubuntu's legacy package
-RUN mkdir -p /etc/apt/keyrings && \\
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \\
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \\
-    apt-get update && apt-get install -y nodejs && \\
-    rm -rf /var/lib/apt/lists/*
-
 # Pre-bake common global Node packages — agent won't need to reinstall these
 RUN npm install -g \\
     typescript \\
@@ -165,7 +160,7 @@ RUN npm install -g \\
     http-server
 
 # Pre-bake common Python packages — agent won't need to reinstall these
-RUN pip3 install --no-cache-dir \\
+RUN pip3 install --break-system-packages --no-cache-dir \\
     requests \\
     numpy \\
     pandas \\

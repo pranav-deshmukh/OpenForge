@@ -1,5 +1,5 @@
 import { callLLM, callLLMWithTools } from './agent.js';
-import type { ToolDefinition, GeminiContent, GeminiPart, ToolCall } from './agent.js';
+import type { ToolDefinition } from './agent.js';
 import {
   ensureWorkspaceReady,
   execInContainer,
@@ -19,8 +19,7 @@ import {
   saveMemory, updateTask, getTask, getMemoryForTask, 
   createSubTask, updateSubTask, getSubTasksForTask, getSubTask,
   createArtifact, getArtifactsForTask, createReflection,
-  getMemoryForSubTask, incrementTaskIterations,
-  getAgentKnowledge, setAgentKnowledge, listAgentKnowledge, deleteAgentKnowledge
+  getMemoryForSubTask, compressContext, incrementTaskIterations, summarizeConversationHistory
 } from './memory.js';
 import {
   clearAgentAssignment,
@@ -40,70 +39,52 @@ function parsePositiveIntEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-const MAX_ITERATIONS_PER_SUBTASK = parsePositiveIntEnv('MAX_ITERATIONS_PER_SUBTASK', 60);
-const MAX_ITERATIONS_TOOL_MODE = parsePositiveIntEnv('MAX_ITERATIONS_TOOL_MODE', 50);
+const MAX_ITERATIONS_PER_SUBTASK = parsePositiveIntEnv('MAX_ITERATIONS_PER_SUBTASK', 75);
+const LEGACY_TOOL_MODE_ITERATIONS = parsePositiveIntEnv('MAX_ITERATIONS_TOOL_MODE', 60);
+const MAX_ITERATIONS_TOOL_MODE_FAST = parsePositiveIntEnv(
+  'MAX_ITERATIONS_TOOL_MODE_FAST',
+  LEGACY_TOOL_MODE_ITERATIONS,
+);
+const MAX_ITERATIONS_TOOL_MODE_RESEARCH = parsePositiveIntEnv(
+  'MAX_ITERATIONS_TOOL_MODE_RESEARCH',
+  Math.max(MAX_ITERATIONS_TOOL_MODE_FAST, 120),
+);
 const MAX_SUBTASK_RETRIES = 3;
 const CONCURRENT_WORKERS = 2;
+
 const MAX_INITIAL_SUBTASKS = 8;
-const MAX_NO_PROGRESS = 4;
-const MAX_TOTAL_AGENT_STEPS = parsePositiveIntEnv('MAX_TOTAL_AGENT_STEPS', 250);
+const MAX_TOTAL_SUBTASKS = 12;
+const MAX_DAG_DEPTH = 3;
+const MAX_NO_PROGRESS = 5;
+
+const LEGACY_TOTAL_AGENT_STEPS = parsePositiveIntEnv('MAX_TOTAL_AGENT_STEPS', 300);
+const MAX_TOTAL_AGENT_STEPS_FAST = parsePositiveIntEnv(
+  'MAX_TOTAL_AGENT_STEPS_FAST',
+  LEGACY_TOTAL_AGENT_STEPS,
+);
+const MAX_TOTAL_AGENT_STEPS_RESEARCH = parsePositiveIntEnv(
+  'MAX_TOTAL_AGENT_STEPS_RESEARCH',
+  Math.max(MAX_TOTAL_AGENT_STEPS_FAST, 600),
+);
 const MAX_REPLAN_ATTEMPTS = 2;
 const MAX_RETRIES_PER_TASK = 2;
-const MAX_TOOL_OUTPUT_CHARS = 4000; // Tight limit prevents context bloat
+const MAX_TOOL_OUTPUT_CHARS = 12000;
 const MAX_STR_REPLACE_FAILURES_PER_FILE = 2;
-const SUMMARIZE_EVERY = 8; // Aggressive context compaction
 
-// ── Native Gemini Content Builders ───────────────────────────────────────────
-
-function userText(content: string): GeminiContent {
-  return { role: 'user', parts: [{ text: content }] };
+function getEffectiveAgentMode(task: Task): AgentMode {
+  return task.agentMode === 'RESEARCH' ? 'RESEARCH' : 'FAST';
 }
 
-function modelToolCalls(calls: ToolCall[], thought?: string): GeminiContent {
-  const parts: GeminiPart[] = [];
-  if (thought) parts.push({ text: thought });
-  for (const call of calls) {
-    parts.push({ functionCall: { name: call.name, args: call.args } });
-  }
-  return { role: 'model', parts };
+function getToolModeIterationLimit(task: Task): number {
+  return getEffectiveAgentMode(task) === 'RESEARCH'
+    ? MAX_ITERATIONS_TOOL_MODE_RESEARCH
+    : MAX_ITERATIONS_TOOL_MODE_FAST;
 }
 
-function toolResultParts(results: { name: string; result: string }[]): GeminiContent {
-  return {
-    role: 'user',
-    parts: results.map(r => ({
-      functionResponse: { name: r.name, response: { result: r.result } }
-    } as GeminiPart)),
-  };
-}
-
-// ── Scratchpad (Running Memory) ──────────────────────────────────────────────
-
-interface Scratchpad {
-  filesRead: Set<string>;
-  filesEdited: Set<string>;
-  commandsRun: number;
-  errors: number;
-  keyFindings: string[];
-}
-
-function newScratchpad(): Scratchpad {
-  return { filesRead: new Set(), filesEdited: new Set(), commandsRun: 0, errors: 0, keyFindings: [] };
-}
-
-function scratchpadSummary(pad: Scratchpad): string {
-  const lines = ['## Working Memory (do NOT re-read these)'];
-  if (pad.filesRead.size > 0) lines.push('Read: ' + [...pad.filesRead].slice(-15).join(', '));
-  if (pad.filesEdited.size > 0) lines.push('Edited: ' + [...pad.filesEdited].join(', '));
-  lines.push(`Cmds: ${pad.commandsRun} | Errors: ${pad.errors}`);
-  if (pad.keyFindings.length > 0) lines.push('Findings:\n- ' + pad.keyFindings.slice(-6).join('\n- '));
-  return lines.join('\n');
-}
-
-function compactHistory(history: GeminiContent[], pad: Scratchpad, keepRecent = 6): GeminiContent[] {
-  if (history.length <= keepRecent + 2) return history;
-  const summary = scratchpadSummary(pad);
-  return [userText(summary), ...history.slice(-keepRecent)];
+function getTotalAgentStepBudget(task: Task): number {
+  return getEffectiveAgentMode(task) === 'RESEARCH'
+    ? MAX_TOTAL_AGENT_STEPS_RESEARCH
+    : MAX_TOTAL_AGENT_STEPS_FAST;
 }
 
 function chooseAgentMode(goal: string, mode: Task['mode'] | null): AgentMode {
@@ -635,66 +616,83 @@ async function runChatMode(task: Task) {
 }
 
 async function runToolMode(task: Task) {
-  const maxIterations = MAX_ITERATIONS_TOOL_MODE;
+  const maxIterations = getToolModeIterationLimit(task);
+  const totalStepBudget = getTotalAgentStepBudget(task);
   updateTask(task.id, { status: 'running', startedAt: Date.now() });
   setAgentPhase('Forge', 'working', {
     currentTaskId: task.id,
     currentTaskGoal: task.goal,
-    note: 'Executing tool task',
+    note: 'Executing linear tool task',
   });
   await ensureWorkspaceReady();
   await syncRuntimeSecretsToContainer();
 
   const preinstalled = await getPreinstalledPackages();
+  const repoContext = await buildRepoContextMessage(task);
+  const envContext = `
+
+## Environment — already installed, DO NOT reinstall these:
+
+Node (global): ${preinstalled.npm.join(', ')}
+Python (pip): ${preinstalled.pip.join(', ')}
+
+If you need a package NOT in the above list, install it normally. It will persist across sessions via Docker volumes.
+`;
+
+  const systemPrompt = getSystemPrompt('standalone_worker', { task });
+  const conversationHistory: Message[] = [{ role: 'user', content: envContext }];
   const repoRoot = await resolveKnownRepoRoot(task);
   let currentWorkingDirectory: string | null = repoRoot;
-
-  // Build initial context with codebase map (saves 3-5 exploration steps)
-  const systemPrompt = getSystemPrompt('standalone_worker', { task });
-  const history: GeminiContent[] = [];
-  const pad = newScratchpad();
-  const previousShellResults = new Map<string, string>();
-  const strReplaceFailuresByFile = new Map<string, number>();
-
-  const envLines = [
-    '## Environment (pre-installed, do NOT reinstall):',
-    `Node: ${preinstalled.npm.join(', ')}`,
-    `Python: ${preinstalled.pip.join(', ')}`,
-  ];
+  if (repoContext) {
+    conversationHistory.push({ role: 'user', content: repoContext });
+  }
+  if (currentWorkingDirectory) {
+    const fingerprint = await buildRepoFingerprint(currentWorkingDirectory);
+    if (fingerprint) {
+      conversationHistory.push({
+        role: 'user',
+        content: `## Codebase Context\n${fingerprint}`,
+      });
+    }
+  }
   if (repoRoot) {
-    const map = await buildRepoFingerprint(repoRoot);
-    if (map) envLines.push('', `## Codebase Context\n${map}`);
-    pad.keyFindings.push(`Codebase mapped at ${repoRoot}`);
-    // Also load repo instructions
     for (const file of ['AGENTS.md', 'CLAUDE.md', '.cursorrules']) {
       const result = await readFileFromContainer(`${repoRoot}/${file}`);
       if (result.exitCode === 0 && result.stdout) {
-        envLines.push('', `## ${file}\n${result.stdout.slice(0, 800)}`);
-        break;
+        conversationHistory.push({
+          role: 'user',
+          content: `Repo instructions from ${file}:\n${result.stdout}`,
+        });
       }
     }
   }
-  envLines.push('', `## Task\n${task.goal}`);
-  history.push(userText(envLines.join('\n')));
+  conversationHistory.push({ role: 'user', content: task.goal });
 
+  // Initialize with task createdAt - 1 to catch very early inputs
   let lastProcessedInputTime = task.createdAt - 1;
-  let consecutiveNoProgress = 0;
-  let lastToolSig = '';
+  const previousShellResults = new Map<string, CommandReplay>();
+  let failedCdCommandCount = 0;
+  const strReplaceFailuresByFile = new Map<string, number>();
 
   for (let i = 1; i <= maxIterations; i++) {
-    if (isTaskCancelled(task.id)) { clearAgentAssignment('Forge'); return; }
-
-    // Aggressive context compaction
-    if (i > 1 && i % SUMMARIZE_EVERY === 0) {
-      history.splice(0, history.length, ...compactHistory(history, pad));
+    if (isTaskCancelled(task.id)) {
+      clearAgentAssignment('Forge');
+      return;
     }
-
+    if (i > 0 && i % 20 === 0) {
+      conversationHistory.splice(0, conversationHistory.length, ...summarizeConversationHistory(conversationHistory, 20));
+    }
     incrementTaskIterations(task.id);
+
     const currentTask = getTask(task.id);
-    const nextSteps = (currentTask?.totalAgentSteps || 0) + 1;
-    updateTask(task.id, { totalAgentSteps: nextSteps });
-    if (nextSteps > MAX_TOTAL_AGENT_STEPS) {
-      updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: `Step budget reached (${MAX_TOTAL_AGENT_STEPS}).` });
+    const nextTotalAgentSteps = (currentTask?.totalAgentSteps || 0) + 1;
+    updateTask(task.id, { totalAgentSteps: nextTotalAgentSteps });
+    if (nextTotalAgentSteps > totalStepBudget) {
+      updateTask(task.id, {
+        status: 'failed',
+        completedAt: Date.now(),
+        error: `Global agent step budget reached in Tool mode (${totalStepBudget} steps).`,
+      });
       clearAgentAssignment('Forge');
       return;
     }
@@ -702,365 +700,268 @@ async function runToolMode(task: Task) {
     // Check for user input
     const newInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
     for (const input of newInputs) {
-      history.push(userText(`USER INPUT: ${input.content}`));
+      conversationHistory.push({ role: 'user', content: `USER INPUT: ${input.content}` });
       lastProcessedInputTime = Math.max(lastProcessedInputTime, input.createdAt);
     }
 
     let response;
     try {
-      response = await callLLMWithTools(systemPrompt, history, WORKER_TOOLS, 'gemini-2.5-flash');
+      const compressedHistory = conversationHistory.map(m => ({
+        ...m,
+        content: compressContext(m.content)
+      }));
+      response = await callLLMWithTools(systemPrompt, compressedHistory, WORKER_TOOLS);
     } catch (err: any) {
-      saveMemory(task.id, 'error', `LLM error: ${err.message}`, null, 'working');
+      saveMemory(task.id, 'error', `LLM error in tool mode: ${err.message}`, null, 'working');
       continue;
     }
 
-    const { thought, toolCalls } = response;
+    const { thought, toolCall } = response;
 
-    // Progress detection
-    const toolSig = toolCalls.map(c => `${c.name}:${JSON.stringify(c.args).slice(0, 80)}`).join('|');
-    if (toolSig === lastToolSig && toolSig !== '') {
-      consecutiveNoProgress++;
-    } else {
-      consecutiveNoProgress = 0;
-    }
-    lastToolSig = toolSig;
-
-    // Reflection-before-retry: nudge strategy change at halfway point
-    if (consecutiveNoProgress === 2) {
-      history.push(userText('STOP: You are repeating the same action. Your previous approach failed. Analyze WHY it failed and try a completely different strategy. Do NOT retry the same tool with the same arguments.'));
+    if (thought) {
+      saveMemory(task.id, 'thought', thought, null, 'working');
+      console.log(`[Tool] Step ${i} thought: ${thought.slice(0, 120)}...`);
     }
 
-    if (consecutiveNoProgress >= MAX_NO_PROGRESS) {
-      updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Stalled: repeating same actions.' });
+    // Push assistant turn into history
+    conversationHistory.push({ role: 'assistant', content: thought || `[tool: ${toolCall?.name}]` });
+
+    if (!toolCall) {
+      conversationHistory.push({ role: 'user', content: 'Please call one of your available tools to proceed. If the task is complete, call task_done.' });
+      continue;
+    }
+
+    console.log(`[Tool] Tool call: ${toolCall.name}`, JSON.stringify(toolCall.args).slice(0, 100));
+
+    // ── Dispatch tool calls ──────────────────────────────────────────────────
+
+    if (toolCall.name === 'task_done') {
+      if (currentWorkingDirectory) {
+        const buildCheck = await runBuildVerification(currentWorkingDirectory);
+        if (!buildCheck.passed) {
+          conversationHistory.push({
+            role: 'user',
+            content: getBuildFailureFeedback(buildCheck.output),
+          });
+          continue;
+        }
+      }
+      const { summary } = toolCall.args;
+      if (!isTaskCancelled(task.id)) {
+        updateTask(task.id, { status: 'done', completedAt: Date.now(), result: summary || 'Task completed via Tool mode.' });
+      }
       clearAgentAssignment('Forge');
       return;
     }
 
-    if (thought) {
-      console.log(`[Tool] Step ${i}: ${thought.slice(0, 100)}`);
-      saveMemory(task.id, 'thought', thought.slice(0, 300), null, 'working');
-    }
-
-    // No tool calls - nudge
-    if (toolCalls.length === 0) {
-      history.push({ role: 'model', parts: [{ text: thought || '(thinking)' }] });
-      history.push(userText('Call a tool to proceed or task_done if complete.'));
+    if (toolCall.name === 'ask_user') {
+      saveMemory(task.id, 'thought', `WAITING FOR USER: ${toolCall.args.question}`, null, 'working');
+      lastProcessedInputTime = await waitForUserInput(task.id, null, lastProcessedInputTime);
+      i--;
       continue;
     }
 
-    // Log tool calls to memory for frontend visibility
-    for (const call of toolCalls) {
-      const argSummary = call.name === 'run_shell' ? `$ ${call.args.command}` :
-        call.name === 'read_file' ? call.args.path :
-        call.name === 'write_file' || call.name === 'str_replace_file' ? call.args.path || call.args.file :
-        call.name === 'multi_edit' ? `${(call.args.operations || []).length} operations` :
-        JSON.stringify(call.args).slice(0, 80);
-      saveMemory(task.id, 'command', `[${call.name}] ${argSummary}`, null, 'working');
-    }
-
-    console.log(`[Tool] Step ${i}: ${toolCalls.length} tool(s): ${toolCalls.map(c => c.name).join(', ')}`);
-
-    // Execute all tool calls in parallel
-    const execResults = await Promise.all(toolCalls.map(async (call) => {
-      return executeToolCallForMode(call, {
-        taskId: task.id, subTaskId: null, cwd: currentWorkingDirectory,
-        pad, previousShell: previousShellResults, strReplaceFailures: strReplaceFailuresByFile,
-      });
-    }));
-
-    // Check for terminal actions
-    let terminated = false;
-    for (let j = 0; j < execResults.length; j++) {
-      const r = execResults[j];
-      if (r.newCwd !== undefined) currentWorkingDirectory = r.newCwd;
-
-      if (r.done) {
-        // Build verification
-        if (currentWorkingDirectory) {
-          const buildCheck = await runBuildVerification(currentWorkingDirectory);
-          if (!buildCheck.passed) {
-            execResults[j] = { ...r, result: `Build failed. Fix before completing:\n${buildCheck.output}` };
-            break; // Don't terminate, push result and continue
-          }
-        }
-        if (!isTaskCancelled(task.id)) {
-          updateTask(task.id, { status: 'done', completedAt: Date.now(), result: r.summary || 'Completed.' });
-        }
-        clearAgentAssignment('Forge');
-        terminated = true;
-        break;
-      }
-
-      if (r.askUser) {
-        saveMemory(task.id, 'thought', `WAITING: ${r.askUser}`, null, 'working');
-        lastProcessedInputTime = await waitForUserInput(task.id, null, lastProcessedInputTime);
-        i--;
-        terminated = true;
-        break;
-      }
-    }
-
-    // Add to history using native protocol (functionCall + functionResponse parts)
-    history.push(modelToolCalls(toolCalls, thought));
-    history.push(toolResultParts(execResults.map((r, k) => ({
-      name: toolCalls[k].name,
-      result: r.result,
-    }))));
-
-    // Log key tool results to memory for frontend
-    for (let k = 0; k < execResults.length; k++) {
-      const r = execResults[k];
-      if (r.done || r.askUser) continue; // Already logged
-      const resultSnippet = r.result.slice(0, 200);
-      if (r.result.includes('FAIL') || r.result.includes('Error') || r.result.includes('exit 1')) {
-        saveMemory(task.id, 'error', `[${toolCalls[k].name}] ${resultSnippet}`, null, 'working');
-      }
-    }
-
-    if (terminated) {
-      if (getTask(task.id)?.status === 'done') return;
+    if (toolCall.name === 'repo_status') {
+      const { path } = toolCall.args;
+      saveMemory(task.id, 'command', `[repo_status] ${path}`, null, 'working');
+      const result = await getRepoStatusInContainer(path);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Repository status for ${path} (exit ${result.exitCode}):\n${output}` });
       continue;
     }
+
+    if (toolCall.name === 'list_files') {
+      const { path, max_depth } = toolCall.args;
+      saveMemory(task.id, 'command', `[list_files] ${path} depth=${max_depth ?? 4}`, null, 'working');
+      const result = await listFilesInContainer(path, Number(max_depth ?? 4));
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Files under ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'search_code') {
+      const { path, pattern, glob } = toolCall.args;
+      saveMemory(task.id, 'command', `[search_code] ${path} :: ${pattern}`, null, 'working');
+      const result = await searchCodeInContainer(path, pattern, glob);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no matches)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Search results for ${JSON.stringify(pattern)} in ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'read_file') {
+      const { path, start_line, end_line } = toolCall.args;
+      const rangeSuffix =
+        start_line != null || end_line != null
+          ? ` lines=${start_line ?? 1}-${end_line ?? 'EOF'}`
+          : '';
+      saveMemory(task.id, 'command', `[read_file] ${path}${rangeSuffix}`, null, 'working');
+      const result = await readFileFromContainer(path, start_line, end_line);
+      const output = truncateToolOutput(result.stdout || '(empty file)');
+      saveMemory(task.id, 'output', output, null, 'working');
+      const label =
+        start_line != null || end_line != null
+          ? `Contents of ${path} (lines ${start_line ?? 1}-${end_line ?? 'EOF'}):`
+          : `Contents of ${path}:`;
+      const truncationWarning = output.includes('[output truncated:')
+        ? '\nIf you need exact edit context from a large file, call read_file again with start_line and end_line for a narrow range.'
+        : '';
+      conversationHistory.push({ role: 'user', content: `${label}\n${output}${truncationWarning}` });
+      continue;
+    }
+
+    if (toolCall.name === 'str_replace_file') {
+      const { file, old_str, new_str } = toolCall.args;
+      const failureCount = strReplaceFailuresByFile.get(file) ?? 0;
+      if (failureCount >= MAX_STR_REPLACE_FAILURES_PER_FILE) {
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, failureCount),
+        });
+        continue;
+      }
+      saveMemory(task.id, 'command', `[str_replace] ${file}`, null, 'working');
+      const result = await strReplaceInContainer(file, old_str, new_str);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      if (result.exitCode === 0) {
+        strReplaceFailuresByFile.delete(file);
+      } else {
+        const nextFailures = failureCount + 1;
+        strReplaceFailuresByFile.set(file, nextFailures);
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, nextFailures),
+        });
+      }
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'delete_block_file') {
+      const { file, start_anchor, end_anchor } = toolCall.args;
+      saveMemory(task.id, 'command', `[delete_block] ${file}`, null, 'working');
+      const result = await deleteBlockInContainer(file, start_anchor, end_anchor);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `delete_block result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'insert_at_line') {
+      const { file, line, text } = toolCall.args;
+      saveMemory(task.id, 'command', `[insert_at_line] ${file}:${line}`, null, 'working');
+      const result = await insertAtLineInContainer(file, line, text);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'write_file') {
+      const { path: filePath, content } = toolCall.args;
+      saveMemory(task.id, 'command', `[write_file] ${filePath}`, null, 'working');
+
+      if (await pathExistsInContainer(filePath)) {
+        conversationHistory.push({ role: 'user', content: `File ${filePath} already exists. Use str_replace_file to edit it.` });
+        continue;
+      }
+
+      const dir = filePath.split('/').slice(0, -1).join('/');
+      if (dir) await execInContainer(`mkdir -p ${JSON.stringify(dir)}`);
+
+      const b64 = Buffer.from(content, 'utf8').toString('base64');
+      const result = await execInContainer(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(filePath)}`);
+      const output = result.exitCode === 0 ? `File created: ${filePath}` : (result.stdout + result.stderr).slice(0, 500);
+
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `write_file (exit ${result.exitCode}): ${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'run_shell') {
+      const { command } = toolCall.args;
+
+      if (isNoisyDiscoveryCommand(command)) {
+        saveMemory(task.id, 'security_alert', `Blocked noisy discovery command: ${command}`, null, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content:
+            'Do not use recursive ls output. Use a narrow command such as `rg --files`, `find . -maxdepth 2 -type f | sort`, or `ls` in a specific directory.',
+        });
+        continue;
+      }
+
+      if (await blockExistingFileOverwrite(task.id, null, command, conversationHistory)) {
+        continue;
+      }
+
+      const isSafe =
+        isObviouslySafe(command) || (await runSecurityAudit(task, command, { title: 'Tool Execution' } as any));
+      if (!isSafe) {
+        saveMemory(task.id, 'security_alert', `Blocked command: ${command}`, null, 'working');
+        conversationHistory.push({ role: 'user', content: 'That command is blocked by the security policy. Please use a safer alternative.' });
+        continue;
+      }
+
+      const effectiveCommand = applyWorkingDirectory(command, currentWorkingDirectory);
+      const priorResult = previousShellResults.get(effectiveCommand);
+      if (priorResult) {
+        saveMemory(task.id, 'thought', `Blocked duplicate shell command: ${effectiveCommand}`, null, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content: buildRepeatCommandFeedback(effectiveCommand, priorResult),
+        });
+        continue;
+      }
+
+      saveMemory(task.id, 'command', `$ ${effectiveCommand}`, null, 'working');
+      const result = await execInContainer(effectiveCommand);
+      currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      if (isCdPathFailure(command, result)) {
+        failedCdCommandCount++;
+        conversationHistory.push({
+          role: 'user',
+          content: 'Shell error: cd failed. Do not retry this path. Use absolute paths directly or re-discover the repo root before running more commands.',
+        });
+        if (failedCdCommandCount > 3) {
+          conversationHistory.push({
+            role: 'user',
+            content: 'Too many consecutive cd failures. Re-read the task and restart from the repo root instead of chaining cd commands.',
+          });
+          failedCdCommandCount = 0;
+        }
+      } else if (result.exitCode === 0) {
+        failedCdCommandCount = 0;
+      }
+      if (result.exitCode === 0) {
+        previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
+      }
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, null, 'working');
+      conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    // Unknown tool
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, delete_block_file, insert_at_line, write_file, ask_user, task_done.` });
   }
 
   if (!isTaskCancelled(task.id)) {
-    updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: `Iteration limit (${maxIterations}).` });
+    updateTask(task.id, {
+      status: 'failed',
+      completedAt: Date.now(),
+      error: `Tool mode iteration budget reached (${maxIterations} steps).`,
+    });
   }
   clearAgentAssignment('Forge');
 }
 
-// Unified tool execution returning structured results
-interface ToolExecResult {
-  result: string;
-  newCwd?: string | null;
-  done?: boolean;
-  summary?: string;
-  askUser?: string;
-}
-
-async function executeToolCallForMode(
-  call: ToolCall,
-  ctx: { taskId: string; subTaskId: string | null; cwd: string | null; pad: Scratchpad; previousShell: Map<string, string>; strReplaceFailures: Map<string, number> }
-): Promise<ToolExecResult> {
-  const { taskId, subTaskId, cwd, pad, previousShell, strReplaceFailures } = ctx;
-
-  switch (call.name) {
-    case 'codebase_map': {
-      const dir = call.args.path || cwd || '/workspace';
-      const map = await buildRepoFingerprint(dir);
-      pad.keyFindings.push(`Mapped ${dir}`);
-      return { result: map || '(empty workspace)' };
-    }
-    case 'repo_status': {
-      const r = await getRepoStatusInContainer(call.args.path);
-      return { result: truncateToolOutput((r.stdout + r.stderr) || '(no output)') };
-    }
-    case 'list_files': {
-      const r = await listFilesInContainer(call.args.path, Number(call.args.max_depth ?? 3));
-      return { result: truncateToolOutput((r.stdout + r.stderr) || '(empty)') };
-    }
-    case 'search_code': {
-      const r = await searchCodeInContainer(call.args.path, call.args.pattern, call.args.glob);
-      const out = truncateToolOutput((r.stdout + r.stderr) || '(no matches)');
-      pad.keyFindings.push(`Searched "${call.args.pattern}": ${r.exitCode === 0 ? 'found' : 'none'}`);
-      return { result: out };
-    }
-    case 'read_file': {
-      const filePath = call.args.path;
-      // Warn if reading a file the agent just created/edited recently
-      if (pad.filesEdited.has(filePath) && !pad.filesRead.has(filePath)) {
-        pad.filesRead.add(filePath);
-        return { result: `NOTE: You just created/edited this file. You already know its contents. Only read if you need to verify.` };
-      }
-      const r = await readFileFromContainer(filePath, call.args.start_line, call.args.end_line);
-      const out = truncateToolOutput(r.stdout || '(empty)');
-      pad.filesRead.add(filePath);
-      return { result: out + (out.includes('[...') ? '\nUse start_line/end_line for exact context.' : '') };
-    }
-    case 'str_replace_file': {
-      const { file, old_str, new_str } = call.args;
-      const failures = strReplaceFailures.get(file) ?? 0;
-      if (failures >= MAX_STR_REPLACE_FAILURES_PER_FILE) {
-        return { result: `BLOCKED: ${failures}x failures on ${file}. Use delete_block_file or insert_at_line.` };
-      }
-      const r = await strReplaceInContainer(file, old_str, new_str);
-      if (r.exitCode === 0) { strReplaceFailures.delete(file); pad.filesEdited.add(file); }
-      else { strReplaceFailures.set(file, failures + 1); }
-      return { result: truncateToolOutput((r.stdout + r.stderr) || (r.exitCode === 0 ? 'OK' : 'FAILED')) };
-    }
-    case 'delete_block_file': {
-      const r = await deleteBlockInContainer(call.args.file, call.args.start_anchor, call.args.end_anchor);
-      if (r.exitCode === 0) pad.filesEdited.add(call.args.file);
-      return { result: truncateToolOutput((r.stdout + r.stderr) || (r.exitCode === 0 ? 'OK' : 'FAILED')) };
-    }
-    case 'insert_at_line': {
-      const r = await insertAtLineInContainer(call.args.file, call.args.line, call.args.text);
-      if (r.exitCode === 0) pad.filesEdited.add(call.args.file);
-      return { result: truncateToolOutput((r.stdout + r.stderr) || (r.exitCode === 0 ? 'OK' : 'FAILED')) };
-    }
-    case 'write_file': {
-      const filePath = call.args.path;
-      if (await pathExistsInContainer(filePath)) {
-        return { result: `File exists. Use str_replace_file to edit.` };
-      }
-      const dir = filePath.split('/').slice(0, -1).join('/');
-      if (dir) await execInContainer(`mkdir -p ${JSON.stringify(dir)}`);
-      const b64 = Buffer.from(call.args.content, 'utf8').toString('base64');
-      const r = await execInContainer(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(filePath)}`);
-      if (r.exitCode === 0) pad.filesEdited.add(filePath);
-      return { result: r.exitCode === 0 ? `Created: ${filePath}` : `Error: ${r.stderr}` };
-    }
-    case 'run_shell': {
-      const { command } = call.args;
-      if (isNoisyDiscoveryCommand(command)) {
-        return { result: 'BLOCKED: Use list_files or search_code instead.' };
-      }
-      // Use Docker -w flag for cwd instead of cd prepending (avoids cd failures)
-      const prior = previousShell.get(command);
-      if (prior) {
-        return { result: `Already ran. Result:\n${prior}\nDo not repeat.` };
-      }
-      const r = await execInContainer(command, 120000, cwd || '/workspace');
-      const out = truncateToolOutput((r.stdout + r.stderr) || '(no output)');
-      pad.commandsRun++;
-      if (r.exitCode !== 0) pad.errors++;
-      if (r.exitCode === 0) previousShell.set(command, out);
-      const newCwd = maybeUpdateWorkingDirectory(cwd, command, r.exitCode);
-      return { result: `Exit ${r.exitCode}\n${out}`, newCwd };
-    }
-    case 'multi_edit': {
-      const ops = call.args.operations as Array<{ action: string; path: string; content?: string; old_str?: string }>;
-      if (!ops || ops.length === 0) return { result: 'Error: no operations provided.' };
-      const results: string[] = [];
-      for (const op of ops.slice(0, 10)) { // Max 10 ops per call
-        try {
-          if (op.action === 'create') {
-            if (await pathExistsInContainer(op.path)) {
-              results.push(`SKIP ${op.path}: already exists (use edit)`);
-              continue;
-            }
-            const dir = op.path.split('/').slice(0, -1).join('/');
-            if (dir) await execInContainer(`mkdir -p ${JSON.stringify(dir)}`);
-            const b64 = Buffer.from(op.content || '', 'utf8').toString('base64');
-            const r = await execInContainer(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(op.path)}`);
-            if (r.exitCode === 0) { pad.filesEdited.add(op.path); results.push(`OK created: ${op.path}`); }
-            else results.push(`FAIL ${op.path}: ${r.stderr.slice(0, 80)}`);
-          } else if (op.action === 'edit') {
-            if (!op.old_str) { results.push(`SKIP ${op.path}: old_str required for edit`); continue; }
-            const r = await strReplaceInContainer(op.path, op.old_str, op.content || '');
-            if (r.exitCode === 0) { pad.filesEdited.add(op.path); results.push(`OK edited: ${op.path}`); }
-            else results.push(`FAIL ${op.path}: ${(r.stdout + r.stderr).slice(0, 80)}`);
-          } else if (op.action === 'delete') {
-            await execInContainer(`rm -f ${JSON.stringify(op.path)}`);
-            results.push(`OK deleted: ${op.path}`);
-          }
-        } catch (err: any) {
-          results.push(`ERROR ${op.path}: ${err.message.slice(0, 60)}`);
-        }
-      }
-      return { result: results.join('\n') };
-    }
-    case 'file_search': {
-      const dir = call.args.path || cwd || '/workspace';
-      const pattern = call.args.pattern;
-      const r = await execInContainer(`find ${JSON.stringify(dir)} -maxdepth 5 -name ${JSON.stringify(pattern)} -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -30`);
-      return { result: truncateToolOutput(r.stdout || '(no files found)') };
-    }
-    case 'semantic_search': {
-      const dir = call.args.path || cwd || '/workspace';
-      const query = call.args.query;
-      // Extract key terms from natural language query for multi-pattern search
-      const keywords = query.replace(/[^a-zA-Z0-9_\-\.]/g, ' ').split(/\s+/).filter((w: string) => w.length > 2 && !['the', 'and', 'for', 'how', 'where', 'what', 'this', 'that', 'with', 'from', 'are', 'was', 'has', 'have', 'been'].includes(w.toLowerCase()));
-      const uniqueTerms = [...new Set(keywords)].slice(0, 5) as string[];
-      const results: string[] = [];
-      for (const term of uniqueTerms) {
-        const r = await searchCodeInContainer(dir, term as string);
-        if (r.exitCode === 0 && r.stdout.trim()) {
-          results.push(`--- "${term}" ---\n${r.stdout.trim().split('\n').slice(0, 10).join('\n')}`);
-        }
-      }
-      const out = results.length > 0 ? results.join('\n\n').slice(0, 6000) : '(no matches for any keywords)';
-      pad.keyFindings.push(`Semantic search: "${query.slice(0, 40)}"`);
-      return { result: out };
-    }
-    case 'get_errors': {
-      const target = call.args.path || cwd || '/workspace';
-      // Try TypeScript first, then eslint
-      let r = await execInContainer(`cd ${JSON.stringify(target)} && npx tsc --noEmit 2>&1 | head -60`, 30000);
-      if (r.exitCode !== 0 || r.stdout.includes('error TS')) {
-        const out = truncateToolOutput(r.stdout || r.stderr || '(no output)', 8000);
-        pad.errors++;
-        return { result: `TypeScript errors:\n${out}` };
-      }
-      // If tsc not available or passes, try generic lint
-      if (r.stdout.includes('not found') || r.stdout.includes('Cannot find')) {
-        r = await execInContainer(`cd ${JSON.stringify(target)} && npx eslint . --max-warnings=0 2>&1 | head -40`, 30000);
-        if (r.exitCode !== 0) {
-          return { result: `Lint errors:\n${truncateToolOutput(r.stdout || r.stderr, 8000)}` };
-        }
-      }
-      return { result: 'No errors found. Build passes.' };
-    }
-    case 'find_usages': {
-      const { symbol, glob } = call.args;
-      const dir = call.args.path || cwd || '/workspace';
-      const globArg = glob ? `--glob "${glob}"` : '--glob "*.{ts,tsx,js,jsx,py,go,rs,java}"';
-      const r = await execInContainer(`cd ${JSON.stringify(dir)} && rg -n --word-regexp ${JSON.stringify(symbol)} ${globArg} 2>&1 | head -50`);
-      const out = (r.stdout + r.stderr).trim() || '(no usages found)';
-      return { result: truncateToolOutput(out) };
-    }
-    case 'web_search': {
-      try {
-        const { tavily } = await import('tavily');
-        const client = tavily({ apiKey: process.env.TAVILY_API_KEY || '' });
-        const response = await client.search(call.args.query, { maxResults: 3 });
-        const out = response.results.map((r: any) => `[${r.title}](${r.url})\n${r.content?.slice(0, 300) || ''}`).join('\n\n');
-        return { result: out || '(no results)' };
-      } catch (err: any) {
-        // Fallback: if no API key or tavily fails
-        return { result: `Web search unavailable: ${err.message}. Try using run_shell with curl for direct URL fetches.` };
-      }
-    }
-    case 'agent_memory': {
-      const { action, key, content } = call.args;
-      switch (action) {
-        case 'read': {
-          if (!key) return { result: 'Error: key required for read.' };
-          const val = getAgentKnowledge(key);
-          return { result: val ?? `(no memory stored for "${key}")` };
-        }
-        case 'write': {
-          if (!key || !content) return { result: 'Error: key and content required for write.' };
-          setAgentKnowledge(key, content);
-          return { result: `Stored: "${key}"` };
-        }
-        case 'list': {
-          const items = listAgentKnowledge();
-          if (items.length === 0) return { result: '(no memories stored)' };
-          return { result: items.map(i => `- ${i.key}: ${i.content.slice(0, 80)}...`).join('\n') };
-        }
-        case 'delete': {
-          if (!key) return { result: 'Error: key required for delete.' };
-          const ok = deleteAgentKnowledge(key);
-          return { result: ok ? `Deleted: "${key}"` : `Not found: "${key}"` };
-        }
-        default:
-          return { result: 'Invalid action. Use: read, write, list, delete.' };
-      }
-    }
-    case 'ask_user': {
-      return { result: 'Waiting for input...', askUser: call.args.question };
-    }
-    case 'task_done': {
-      return { result: 'Complete.', done: true, summary: call.args.summary };
-    }
-    default:
-      return { result: `Unknown tool: ${call.name}` };
-  }
-}
 export async function runOrchestrator(task: Task): Promise<void> {
   try {
-    const totalStepBudget = MAX_TOTAL_AGENT_STEPS;
+    const totalStepBudget = getTotalAgentStepBudget(task);
     console.log(`\n[Orchestrator] Starting: ${task.goal}`);
     updateTask(task.id, { 
       status: 'running', 
@@ -1379,15 +1280,6 @@ async function planTask(task: Task) {
 // ── Tool definitions — the agent sees these and picks automatically ──────────
 const WORKER_TOOLS: ToolDefinition[] = [
   {
-    name: 'codebase_map',
-    description: 'Get instant codebase orientation: directory tree, package manifest, repo instructions. Call FIRST when starting work on a new repo instead of manual exploration.',
-    parameters: {
-      type: 'object',
-      properties: { path: { type: 'string', description: 'Root directory to map, default /workspace' } },
-      required: []
-    }
-  },
-  {
     name: 'repo_status',
     description: 'Inspect an existing git repository without guessing shell commands. Use this first for repo tasks to confirm the repo root and current branch/status.',
     parameters: {
@@ -1556,101 +1448,6 @@ const WORKER_TOOLS: ToolDefinition[] = [
     },
   },
   {
-    name: 'multi_edit',
-    description: 'Apply MULTIPLE file operations in a single call. Use this to create several files at once, or make edits across multiple files. Much faster than calling write_file/str_replace_file one at a time.',
-    parameters: {
-      type: 'object',
-      properties: {
-        operations: {
-          type: 'array',
-          description: 'Array of file operations to perform',
-          items: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', description: '"create" | "edit" | "delete"' },
-              path: { type: 'string', description: 'Absolute file path' },
-              content: { type: 'string', description: 'Full content for "create", or new_str for "edit"' },
-              old_str: { type: 'string', description: 'For "edit" only: exact text to replace' }
-            }
-          }
-        }
-      },
-      required: ['operations']
-    }
-  },
-  {
-    name: 'file_search',
-    description: 'Find files by name or glob pattern. Use when you know the filename but not the path (e.g. "find all *.test.ts files" or "where is package.json").',
-    parameters: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string', description: 'Filename or glob pattern to search for (e.g. "*.tsx", "package.json", "App.*")' },
-        path: { type: 'string', description: 'Directory to search in, default /workspace' }
-      },
-      required: ['pattern']
-    }
-  },
-  {
-    name: 'semantic_search',
-    description: 'Search the codebase by meaning/intent. Use when you are not sure of exact words. Extracts keywords from your query and searches across multiple patterns. Better than search_code for exploratory searches.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Natural language description of what you are looking for (e.g. "where is the authentication middleware defined")' },
-        path: { type: 'string', description: 'Directory to search in, default /workspace' }
-      },
-      required: ['query']
-    }
-  },
-  {
-    name: 'get_errors',
-    description: 'Get compile/lint errors for the project or a specific file. Run this AFTER every edit to verify your changes compile. Returns structured diagnostics (file, line, message).',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Project root or specific file to check. Default: inferred from cwd.' }
-      },
-      required: []
-    }
-  },
-  {
-    name: 'find_usages',
-    description: 'Find all references/usages of a symbol (function, class, variable) across the codebase. Use BEFORE renaming or deleting anything to understand impact.',
-    parameters: {
-      type: 'object',
-      properties: {
-        symbol: { type: 'string', description: 'Exact symbol name to find (e.g. "handleSubmit", "UserService")' },
-        path: { type: 'string', description: 'Directory to search in, default /workspace' },
-        glob: { type: 'string', description: 'Optional file glob to narrow search (e.g. "*.ts")' }
-      },
-      required: ['symbol']
-    }
-  },
-  {
-    name: 'web_search',
-    description: 'Search the web for documentation, API references, or solutions. Use when you need external information (library docs, error solutions, API specs).',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query' }
-      },
-      required: ['query']
-    }
-  },
-  {
-    name: 'agent_memory',
-    description: 'Persistent memory across tasks. Store/retrieve patterns, conventions, project facts you learn. Use "read" to check what you already know. Use "write" to save new insights.',
-    parameters: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', description: '"read" | "write" | "list" | "delete"' },
-        key: { type: 'string', description: 'Memory key (e.g. "project-conventions", "build-commands", "common-patterns")' },
-        content: { type: 'string', description: 'Content to store (required for "write")' }
-      },
-      required: ['action']
-    }
-  },
-  {
     name: 'ask_user',
     description: 'Pause execution and ask the user a clarifying question. Only use when genuinely blocked and cannot proceed without human input.',
     parameters: {
@@ -1694,169 +1491,401 @@ const WORKER_TOOLS: ToolDefinition[] = [
 
 async function runWorkerAgent(task: Task, subTask: SubTask) {
   const assignedAgent = getSubTaskAgentId(subTask);
-  updateSubTask(subTask.id, { status: 'running', startedAt: Date.now(), assignedAgent, error: undefined });
-  setAgentPhase(assignedAgent, 'working', {
-    currentTaskId: task.id, currentTaskGoal: task.goal,
-    currentSubTaskId: subTask.id, currentSubTaskTitle: subTask.title, note: subTask.description,
+  updateSubTask(subTask.id, {
+    status: 'running',
+    startedAt: Date.now(),
+    assignedAgent,
+    error: undefined,
   });
-
+  setAgentPhase(assignedAgent, 'working', {
+    currentTaskId: task.id,
+    currentTaskGoal: task.goal,
+    currentSubTaskId: subTask.id,
+    currentSubTaskTitle: subTask.title,
+    note: subTask.description,
+  });
+  saveMemory(task.id, 'thought', `Worker starting subtask: ${subTask.title}`, subTask.id, 'working');
   await ensureWorkspaceReady();
   await syncRuntimeSecretsToContainer();
 
   const preinstalled = await getPreinstalledPackages();
-  const repoRoot = await resolveKnownRepoRoot(task, subTask);
-  let cwd: string | null = repoRoot;
+  const repoContext = await buildRepoContextMessage(task, subTask);
+  const envContext = `
+
+## Environment — already installed, DO NOT reinstall these:
+
+Node (global): ${preinstalled.npm.join(', ')}
+Python (pip): ${preinstalled.pip.join(', ')}
+
+If you need a package NOT in the above list, install it normally. It will persist across sessions via Docker volumes.
+`;
 
   const artifacts = getArtifactsForTask(task.id);
   const systemPrompt = getSystemPrompt('worker', { task, subTask, artifacts });
-  const history: GeminiContent[] = [];
-  const pad = newScratchpad();
-  const previousShell = new Map<string, string>();
-  const strReplaceFailures = new Map<string, number>();
 
-  // Build efficient initial context
-  const envLines = [
-    `## Environment (pre-installed): Node: ${preinstalled.npm.join(', ')} | Python: ${preinstalled.pip.join(', ')}`,
-  ];
-  if (repoRoot) {
-    const map = await buildRepoFingerprint(repoRoot);
-    if (map) envLines.push(`## Codebase\n${map}`);
-    pad.keyFindings.push(`Mapped ${repoRoot}`);
+  const conversationHistory: Message[] = [{ role: 'user', content: envContext }];
+  let currentWorkingDirectory: string | null = await resolveKnownRepoRoot(task, subTask);
+  if (repoContext) {
+    conversationHistory.push({ role: 'user', content: repoContext });
   }
-  envLines.push(`## Milestone: ${subTask.title}`, subTask.description, `Success Criteria: ${subTask.successCriteria.join(', ')}`);
-  history.push(userText(envLines.join('\n')));
+  if (currentWorkingDirectory) {
+    const fingerprint = await buildRepoFingerprint(currentWorkingDirectory);
+    if (fingerprint) {
+      conversationHistory.push({
+        role: 'user',
+        content: `## Codebase Context\n${fingerprint}`,
+      });
+    }
+  }
+  conversationHistory.push({
+    role: 'user',
+    content: `Start working on SubTask: ${subTask.title}\nDescription: ${subTask.description}`,
+  });
 
   let lastProcessedInputTime = subTask.createdAt - 1;
   let consecutiveNoProgress = 0;
-  let lastToolSig = '';
+  let lastState = { thought: '', toolName: '', toolArgs: '' };
+  const previousShellResults = new Map<string, CommandReplay>();
+  let failedCdCommandCount = 0;
+  const strReplaceFailuresByFile = new Map<string, number>();
 
   for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
-    if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) { clearAgentAssignment(assignedAgent); return; }
-
-    if (i > 1 && i % SUMMARIZE_EVERY === 0) {
-      history.splice(0, history.length, ...compactHistory(history, pad));
+    if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+      clearAgentAssignment(assignedAgent);
+      return;
+    }
+    if (i > 0 && i % 20 === 0) {
+      conversationHistory.splice(0, conversationHistory.length, ...summarizeConversationHistory(conversationHistory, 20));
+    }
+    incrementTaskIterations(task.id);
+    
+    // Update global step count
+    const currentTask = getTask(task.id);
+    if (currentTask) {
+      updateTask(task.id, { totalAgentSteps: (currentTask.totalAgentSteps || 0) + 1 });
     }
 
-    incrementTaskIterations(task.id);
-    const currentTask = getTask(task.id);
-    if (currentTask) updateTask(task.id, { totalAgentSteps: (currentTask.totalAgentSteps || 0) + 1 });
-
-    // User input
-    const newInputs = getMemoryForSubTask(subTask.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
+    // Check for user input
+    const newInputs = getMemoryForSubTask(subTask.id).filter(
+      m => m.type === 'input' && m.createdAt > lastProcessedInputTime
+    );
     for (const input of newInputs) {
-      history.push(userText(`USER INPUT: ${input.content}`));
+      conversationHistory.push({ role: 'user', content: `USER INPUT: ${input.content}` });
       lastProcessedInputTime = Math.max(lastProcessedInputTime, input.createdAt);
     }
 
     let response;
     try {
-      response = await callLLMWithTools(systemPrompt, history, WORKER_TOOLS, 'gemini-2.5-flash');
+      const compressedHistory = conversationHistory.map(m => ({
+        ...m,
+        content: compressContext(m.content)
+      }));
+      response = await callLLMWithTools(systemPrompt, compressedHistory, WORKER_TOOLS);
     } catch (err: any) {
-      saveMemory(task.id, 'error', `LLM error: ${err.message}`, subTask.id, 'working');
+      saveMemory(task.id, 'error', `LLM error in worker: ${err.message}`, subTask.id, 'working');
       continue;
     }
 
-    const { thought, toolCalls } = response;
+    const { thought, toolCall } = response;
 
     // Progress detection
-    const toolSig = toolCalls.map(c => `${c.name}:${JSON.stringify(c.args).slice(0, 60)}`).join('|');
-    if (toolSig === lastToolSig && toolSig !== '') { consecutiveNoProgress++; } else { consecutiveNoProgress = 0; }
-    lastToolSig = toolSig;
-
-    // Reflection-before-retry
-    if (consecutiveNoProgress === 2) {
-      history.push(userText('STOP: You are repeating the same action. Analyze WHY it failed and try a completely different strategy.'));
+    const currentState = { 
+      thought: thought || '', 
+      toolName: toolCall?.name || '', 
+      toolArgs: JSON.stringify(toolCall?.args || {}) 
+    };
+    
+    if (currentState.thought === lastState.thought && 
+        currentState.toolName === lastState.toolName && 
+        currentState.toolArgs === lastState.toolArgs) {
+      consecutiveNoProgress++;
+    } else {
+      consecutiveNoProgress = 0;
     }
+    lastState = currentState;
 
     if (consecutiveNoProgress >= MAX_NO_PROGRESS) {
-      updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Stalled' });
+      const msg = `Subtask failed: No meaningful progress for ${MAX_NO_PROGRESS} iterations. Stalled at: ${currentState.thought.slice(0, 100)}`;
+      saveMemory(task.id, 'error', msg, subTask.id, 'working');
+      updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Stalled: No progress detected' });
       clearAgentAssignment(assignedAgent);
       return;
     }
 
     if (thought) {
-      console.log(`[Worker:${subTask.title}] Step ${i}: ${thought.slice(0, 80)}`);
-      saveMemory(task.id, 'thought', `[${subTask.title}] ${thought.slice(0, 300)}`, subTask.id, 'working');
+      saveMemory(task.id, 'thought', `[${subTask.title}] ${thought}`, subTask.id, 'working');
+      console.log(`[Worker] ${subTask.title} thought: ${thought.slice(0, 120)}...`);
     }
 
-    if (toolCalls.length === 0) {
-      history.push({ role: 'model', parts: [{ text: thought || '(thinking)' }] });
-      history.push(userText('Call a tool or task_done.'));
+    // Push assistant turn into history
+    conversationHistory.push({ role: 'assistant', content: thought || `[tool: ${toolCall?.name}]` });
+
+    if (!toolCall) {
+      // Model returned text only — nudge it to use a tool
+      conversationHistory.push({ role: 'user', content: 'Please call one of your available tools to proceed. If the task is complete, call task_done.' });
       continue;
     }
 
-    // Log tool calls to memory for frontend visibility
-    for (const call of toolCalls) {
-      const argSummary = call.name === 'run_shell' ? `$ ${call.args.command}` :
-        call.name === 'read_file' ? call.args.path :
-        call.name === 'write_file' || call.name === 'str_replace_file' ? call.args.path || call.args.file :
-        call.name === 'multi_edit' ? `${(call.args.operations || []).length} operations` :
-        JSON.stringify(call.args).slice(0, 80);
-      saveMemory(task.id, 'command', `[${call.name}] ${argSummary}`, subTask.id, 'working');
+    console.log(`[Worker] Tool call: ${toolCall.name}`, JSON.stringify(toolCall.args).slice(0, 100));
+
+    // ── Dispatch tool calls ──────────────────────────────────────────────────
+
+    if (toolCall.name === 'task_done') {
+      if (currentWorkingDirectory) {
+        const buildCheck = await runBuildVerification(currentWorkingDirectory);
+        if (!buildCheck.passed) {
+          conversationHistory.push({
+            role: 'user',
+            content: getBuildFailureFeedback(buildCheck.output),
+          });
+          continue;
+        }
+      }
+      const { summary, artifacts: arts = [] } = toolCall.args;
+      for (const art of arts) {
+        createArtifact({
+          taskId: task.id,
+          name: art.name,
+          type: art.type || 'unknown',
+          content: art.content || '',
+          producerSubTaskId: subTask.id
+        });
+      }
+      if (!isTaskCancelled(task.id) && !isSubTaskCancelled(subTask.id)) {
+        updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: summary });
+      }
+      return;
     }
 
-    console.log(`[Worker:${subTask.title}] ${toolCalls.length} tool(s): ${toolCalls.map(c => c.name).join(', ')}`);
-
-    // Execute tools in parallel
-    const execResults = await Promise.all(toolCalls.map(call =>
-      executeToolCallForMode(call, { taskId: task.id, subTaskId: subTask.id, cwd, pad, previousShell, strReplaceFailures })
-    ));
-
-    let terminated = false;
-    for (let j = 0; j < execResults.length; j++) {
-      const r = execResults[j];
-      if (r.newCwd !== undefined) cwd = r.newCwd;
-
-      if (r.done) {
-        if (cwd) {
-          const buildCheck = await runBuildVerification(cwd);
-          if (!buildCheck.passed) {
-            execResults[j] = { ...r, result: `Build failed:\n${buildCheck.output}` };
-            break;
-          }
-        }
-        const { artifacts: arts = [] } = toolCalls[j].args;
-        for (const art of arts) {
-          createArtifact({ taskId: task.id, name: art.name, type: art.type || 'unknown', content: art.content || '', producerSubTaskId: subTask.id });
-        }
-        if (!isSubTaskCancelled(subTask.id)) {
-          updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: r.summary });
-        }
-        clearAgentAssignment(assignedAgent);
-        terminated = true;
-        break;
-      }
-
-      if (r.askUser) {
-        updateSubTask(subTask.id, { status: 'waiting_for_human' });
-        await waitForUserInput(task.id, subTask.id, lastProcessedInputTime);
-        updateSubTask(subTask.id, { status: 'running' });
-        i--;
-        terminated = true;
-        break;
-      }
-    }
-
-    history.push(modelToolCalls(toolCalls, thought));
-    history.push(toolResultParts(execResults.map((r, k) => ({ name: toolCalls[k].name, result: r.result }))));
-
-    // Log key tool results to memory for frontend
-    for (let k = 0; k < execResults.length; k++) {
-      const r = execResults[k];
-      if (r.done || r.askUser) continue;
-      if (r.result.includes('FAIL') || r.result.includes('Error') || r.result.includes('exit 1')) {
-        saveMemory(task.id, 'error', `[${toolCalls[k].name}] ${r.result.slice(0, 200)}`, subTask.id, 'working');
-      }
-    }
-
-    if (terminated) {
-      if (getSubTask(subTask.id)?.status === 'done') return;
+    if (toolCall.name === 'ask_user') {
+      saveMemory(task.id, 'thought', `[${subTask.title}] WAITING FOR USER: ${toolCall.args.question}`, subTask.id, 'working');
+      updateSubTask(subTask.id, { status: 'waiting_for_human' });
+      setAgentPhase(assignedAgent, 'blocked', {
+        currentTaskId: task.id,
+        currentTaskGoal: task.goal,
+        currentSubTaskId: subTask.id,
+        currentSubTaskTitle: subTask.title,
+        note: toolCall.args.question,
+      });
+      lastProcessedInputTime = await waitForUserInput(task.id, subTask.id, lastProcessedInputTime);
+      updateSubTask(subTask.id, { status: 'running' });
+      setAgentPhase(assignedAgent, 'working', {
+        currentTaskId: task.id,
+        currentTaskGoal: task.goal,
+        currentSubTaskId: subTask.id,
+        currentSubTaskTitle: subTask.title,
+        note: subTask.description,
+      });
+      i--;
       continue;
     }
+
+    if (toolCall.name === 'repo_status') {
+      const { path } = toolCall.args;
+      saveMemory(task.id, 'command', `[repo_status] ${path}`, subTask.id, 'working');
+      const result = await getRepoStatusInContainer(path);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Repository status for ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'list_files') {
+      const { path, max_depth } = toolCall.args;
+      saveMemory(task.id, 'command', `[list_files] ${path} depth=${max_depth ?? 4}`, subTask.id, 'working');
+      const result = await listFilesInContainer(path, Number(max_depth ?? 4));
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Files under ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'search_code') {
+      const { path, pattern, glob } = toolCall.args;
+      saveMemory(task.id, 'command', `[search_code] ${path} :: ${pattern}`, subTask.id, 'working');
+      const result = await searchCodeInContainer(path, pattern, glob);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no matches)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Search results for ${JSON.stringify(pattern)} in ${path} (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'read_file') {
+      const { path, start_line, end_line } = toolCall.args;
+      const rangeSuffix =
+        start_line != null || end_line != null
+          ? ` lines=${start_line ?? 1}-${end_line ?? 'EOF'}`
+          : '';
+      saveMemory(task.id, 'command', `[read_file] ${path}${rangeSuffix}`, subTask.id, 'working');
+      const result = await readFileFromContainer(path, start_line, end_line);
+      const output = truncateToolOutput(result.stdout || '(empty file)');
+      saveMemory(task.id, 'output', output, subTask.id, 'working');
+      const label =
+        start_line != null || end_line != null
+          ? `Contents of ${path} (lines ${start_line ?? 1}-${end_line ?? 'EOF'}):`
+          : `Contents of ${path}:`;
+      const truncationWarning = output.includes('[output truncated:')
+        ? '\nIf you need exact edit context from a large file, call read_file again with start_line and end_line for a narrow range.'
+        : '';
+      conversationHistory.push({ role: 'user', content: `${label}\n${output}${truncationWarning}` });
+      continue;
+    }
+
+    if (toolCall.name === 'str_replace_file') {
+      const { file, old_str, new_str } = toolCall.args;
+      const failureCount = strReplaceFailuresByFile.get(file) ?? 0;
+      if (failureCount >= MAX_STR_REPLACE_FAILURES_PER_FILE) {
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, failureCount),
+        });
+        continue;
+      }
+      saveMemory(task.id, 'command', `[str_replace] ${file}`, subTask.id, 'working');
+      const result = await strReplaceInContainer(file, old_str, new_str);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      if (result.exitCode === 0) {
+        strReplaceFailuresByFile.delete(file);
+      } else {
+        const nextFailures = failureCount + 1;
+        strReplaceFailuresByFile.set(file, nextFailures);
+        conversationHistory.push({
+          role: 'user',
+          content: getStrReplaceFailureFeedback(file, nextFailures),
+        });
+      }
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `str_replace result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'delete_block_file') {
+      const { file, start_anchor, end_anchor } = toolCall.args;
+      saveMemory(task.id, 'command', `[delete_block] ${file}`, subTask.id, 'working');
+      const result = await deleteBlockInContainer(file, start_anchor, end_anchor);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `delete_block result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'insert_at_line') {
+      const { file, line, text } = toolCall.args;
+      saveMemory(task.id, 'command', `[insert_at_line] ${file}:${line}`, subTask.id, 'working');
+      const result = await insertAtLineInContainer(file, line, text);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `insert_at_line result (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'write_file') {
+      const { path: filePath, content } = toolCall.args;
+      saveMemory(task.id, 'command', `[write_file] ${filePath}`, subTask?.id ?? null, 'working');
+
+      if (await pathExistsInContainer(filePath)) {
+        conversationHistory.push({ role: 'user', content: `File ${filePath} already exists. Use str_replace_file to edit it.` });
+        continue;
+      }
+
+      const dir = filePath.split('/').slice(0, -1).join('/');
+      if (dir) await execInContainer(`mkdir -p ${JSON.stringify(dir)}`);
+
+      const b64 = Buffer.from(content, 'utf8').toString('base64');
+      const result = await execInContainer(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(filePath)}`);
+      const output = result.exitCode === 0 ? `File created: ${filePath}` : (result.stdout + result.stderr).slice(0, 500);
+
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask?.id ?? null, 'working');
+      conversationHistory.push({ role: 'user', content: `write_file (exit ${result.exitCode}): ${output}` });
+      continue;
+    }
+
+    if (toolCall.name === 'run_shell') {
+      const { command } = toolCall.args;
+
+      if (isNoisyDiscoveryCommand(command)) {
+        saveMemory(task.id, 'security_alert', `Blocked noisy discovery command: ${command}`, subTask.id, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content:
+            'Do not use recursive ls output. Use a narrow command such as `rg --files`, `find . -maxdepth 2 -type f | sort`, or `ls` in a specific directory.',
+        });
+        continue;
+      }
+
+      if (await blockExistingFileOverwrite(task.id, subTask.id, command, conversationHistory)) {
+        continue;
+      }
+
+      // Static blocklist - runs before LLM security audit
+      const ALWAYS_BLOCK = [
+        /rm\s+-rf\s+\/(?!workspace)/,
+        /chmod\s+777\s+\//,
+        /curl[^|]+\|\s*(bash|sh)/,
+        /wget[^|]+\|\s*(bash|sh)/,
+        />\s*\/etc\//,
+        /mkfs/,
+        /dd\s+if=/,
+      ];
+      const hardBlocked = ALWAYS_BLOCK.some(pattern => pattern.test(command));
+      if (hardBlocked) {
+        saveMemory(task.id, 'security_alert', `Hard-blocked command: ${command}`, subTask.id, 'working');
+        conversationHistory.push({ role: 'user', content: 'That command is blocked by the security policy. Please use a safer alternative.' });
+        continue;
+      }
+
+      const isSafe = isObviouslySafe(command) || (await runSecurityAudit(task, command, subTask));
+      if (!isSafe) {
+        saveMemory(task.id, 'security_alert', `Security audit blocked: ${command}`, subTask.id, 'working');
+        conversationHistory.push({ role: 'user', content: 'Security Audit FAILED: command blocked. Please suggest an alternative approach.' });
+        continue;
+      }
+
+      const effectiveCommand = applyWorkingDirectory(command, currentWorkingDirectory);
+      const priorResult = previousShellResults.get(effectiveCommand);
+      if (priorResult) {
+        saveMemory(task.id, 'thought', `Blocked duplicate shell command: ${effectiveCommand}`, subTask.id, 'working');
+        conversationHistory.push({
+          role: 'user',
+          content: buildRepeatCommandFeedback(effectiveCommand, priorResult),
+        });
+        continue;
+      }
+
+      saveMemory(task.id, 'command', `$ ${effectiveCommand}`, subTask.id, 'working');
+      const result = await execInContainer(effectiveCommand, 600000);
+      currentWorkingDirectory = maybeUpdateWorkingDirectory(currentWorkingDirectory, command, result.exitCode);
+      const output = truncateToolOutput((result.stdout + result.stderr) || '(no output)');
+      if (isCdPathFailure(command, result)) {
+        failedCdCommandCount++;
+        conversationHistory.push({
+          role: 'user',
+          content: 'Shell error: cd failed. Do not retry this path. Use absolute paths directly or re-discover the repo root before running more commands.',
+        });
+        if (failedCdCommandCount > 3) {
+          conversationHistory.push({
+            role: 'user',
+            content: 'Too many consecutive cd failures. Re-read the task and restart from the repo root instead of chaining cd commands.',
+          });
+          failedCdCommandCount = 0;
+        }
+      } else if (result.exitCode === 0) {
+        failedCdCommandCount = 0;
+      }
+      if (result.exitCode === 0) {
+        previousShellResults.set(effectiveCommand, { output, exitCode: result.exitCode });
+      }
+      saveMemory(task.id, 'output', `Exit ${result.exitCode}\n${output}`, subTask.id, 'working');
+      conversationHistory.push({ role: 'user', content: `Command output (exit ${result.exitCode}):\n${output}` });
+      continue;
+    }
+
+    // Unknown tool - tell the model
+    conversationHistory.push({ role: 'user', content: `Unknown tool: ${toolCall.name}. Available tools: repo_status, list_files, search_code, run_shell, read_file, str_replace_file, delete_block_file, insert_at_line, write_file, ask_user, task_done.` });
   }
 
-  if (!isSubTaskCancelled(subTask.id)) {
-    updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations' });
+  if (!isTaskCancelled(task.id) && !isSubTaskCancelled(subTask.id)) {
+    updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations reached' });
   }
   clearAgentAssignment(assignedAgent);
 }
@@ -2059,8 +2088,8 @@ async function reflectAndReplan(task: Task) {
     const plan = JSON.parse(cleanJsonResponse(response));
     const newSubTasks = plan.subTasks.filter((st: any) => !subTasks.find((existing) => existing.title === st.title));
     
-    if (subTasks.length + newSubTasks.length > MAX_INITIAL_SUBTASKS * 2) {
-      throw new Error(`Replanning would exceed subtask limit. Current: ${subTasks.length}, New: ${newSubTasks.length}`);
+    if (subTasks.length + newSubTasks.length > MAX_TOTAL_SUBTASKS) {
+      throw new Error(`Replanning would exceed MAX_TOTAL_SUBTASKS (${MAX_TOTAL_SUBTASKS}). Current: ${subTasks.length}, New: ${newSubTasks.length}`);
     }
 
     const created: SubTask[] = newSubTasks.map((st: any) =>
@@ -2091,8 +2120,8 @@ async function reflectAndReplan(task: Task) {
     // Depth check after linking
     const allSubTasks = getSubTasksForTask(task.id);
     const currentDepth = calculateDagDepth(allSubTasks);
-    if (currentDepth > 3) {
-      throw new Error(`Replanning exceeded max DAG depth (3). Current: ${currentDepth}`);
+    if (currentDepth > MAX_DAG_DEPTH) {
+      throw new Error(`Replanning exceeded MAX_DAG_DEPTH (${MAX_DAG_DEPTH}). Current depth: ${currentDepth}`);
     }
 
     clearAgentAssignment('Atlas');

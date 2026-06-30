@@ -12,6 +12,7 @@ type FilterType = "All" | "Running" | "Done" | "Failed" | "Pending";
 export default function TasksPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<FilterType>("All");
+  const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedSubTasks, setExpandedSubTasks] = useState<SubTask[]>([]);
   const [expandedArtifacts, setExpandedArtifacts] = useState<Artifact[]>([]);
@@ -30,7 +31,10 @@ export default function TasksPage() {
     try {
       const fetched = await api.getTasks();
       setTasks(fetched || []);
-    } catch {}
+      setError(null);
+    } catch {
+      setError(`Cannot reach server at ${api.API_BASE}. Is it running?`);
+    }
   };
 
   const handleExpand = async (taskId: string) => {
@@ -112,6 +116,11 @@ export default function TasksPage() {
         </div>
 
         <div className="flex-1 w-full overflow-x-auto relative">
+          {error && (
+            <div className="mb-4 rounded-sm border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-300 font-mono">
+              {error}
+            </div>
+          )}
           <div className="min-w-[800px]">
             <div className="grid grid-cols-[120px_4fr_100px_120px_100px_110px] gap-4 py-3 px-4 text-[10px] uppercase font-mono tracking-widest text-text-dim border-b border-bg-border">
               <div>STATUS</div>

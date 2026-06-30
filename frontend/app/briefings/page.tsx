@@ -18,6 +18,7 @@ function mergeAgents(agents: AgentActivitySnapshot[]): AgentActivitySnapshot[] {
 export default function BriefingsPage() {
   const [agents, setAgents] = useState<AgentActivitySnapshot[]>([]);
   const [system, setSystem] = useState<SystemStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -31,9 +32,11 @@ export default function BriefingsPage() {
         if (!cancelled) {
           setAgents(mergeAgents(nextAgents));
           setSystem(nextSystem);
+          setError(null);
         }
-      } catch {
+      } catch (err: any) {
         if (!cancelled) {
+          setError(`Cannot reach server at ${api.API_BASE}. Is it running?`);
           setAgents([]);
           setSystem(null);
         }
@@ -58,7 +61,7 @@ export default function BriefingsPage() {
     };
 
     socket.on("agent:update", refresh);
-    socket.on("task:memory", refresh);
+    socket.on("task:update", refresh);
     socket.on("subtask:update", refresh);
 
     return () => {
@@ -96,6 +99,12 @@ export default function BriefingsPage() {
             </div>
           </div>
         </div>
+
+        {error && (
+          <div className="mt-4 rounded-2xl border border-rose-300/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-400 font-mono">
+            {error}
+          </div>
+        )}
 
         <div className="mt-8 grid gap-5 xl:grid-cols-3">
           {agents.map((agent) => (

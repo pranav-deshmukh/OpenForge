@@ -27,6 +27,7 @@ export default function AgentsPage() {
   const [agents, setAgents] = useState<AgentSnapshot[]>([]);
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -42,9 +43,11 @@ export default function AgentsPage() {
           setAgents(mergeAgents(nextAgents));
           setSystem(nextSystem);
           setTasks(mergeTasks(nextTasks));
+          setError(null);
         }
       } catch {
         if (!cancelled) {
+          setError(`Cannot reach server at ${api.API_BASE}. Is it running?`);
           setSystem(null);
         }
       }
@@ -110,6 +113,12 @@ export default function AgentsPage() {
             </div>
           </div>
         </div>
+
+        {error && (
+          <div className="mt-4 rounded-2xl border border-rose-300/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-400 font-mono">
+            {error}
+          </div>
+        )}
 
         <div className="mt-8 grid gap-5 xl:grid-cols-3">
           {agents.map((agent) => (
