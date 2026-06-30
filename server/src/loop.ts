@@ -14,6 +14,7 @@ import {
   getPreinstalledPackages,
   syncRuntimeSecretsToContainer,
 } from "./shell.js";
+import { executeWithAider } from './aider-executor.js';
 // Skills are loaded dynamically in future — not injected statically
 import { 
   saveMemory, updateTask, getTask, getMemoryForTask, 
@@ -635,196 +636,46 @@ async function runChatMode(task: Task) {
 }
 
 async function runToolMode(task: Task) {
-  const maxIterations = MAX_ITERATIONS_TOOL_MODE;
   updateTask(task.id, { status: 'running', startedAt: Date.now() });
   setAgentPhase('Forge', 'working', {
     currentTaskId: task.id,
     currentTaskGoal: task.goal,
-    note: 'Executing tool task',
+    note: 'Executing via Aider',
   });
   await ensureWorkspaceReady();
   await syncRuntimeSecretsToContainer();
 
-  const preinstalled = await getPreinstalledPackages();
   const repoRoot = await resolveKnownRepoRoot(task);
-  let currentWorkingDirectory: string | null = repoRoot;
+  const workDir = repoRoot || '/workspace';
 
-  // Build initial context with codebase map (saves 3-5 exploration steps)
-  const systemPrompt = getSystemPrompt('standalone_worker', { task });
-  const history: GeminiContent[] = [];
-  const pad = newScratchpad();
-  const previousShellResults = new Map<string, string>();
-  const strReplaceFailuresByFile = new Map<string, number>();
+  // Delegate to Aider with auto-retry
+  const result = await executeWithAider(task.goal, workDir, task.id, null, 3);
 
-  const envLines = [
-    '## Environment (pre-installed, do NOT reinstall):',
-    `Node: ${preinstalled.npm.join(', ')}`,
-    `Python: ${preinstalled.pip.join(', ')}`,
-  ];
-  if (repoRoot) {
-    const map = await buildRepoFingerprint(repoRoot);
-    if (map) envLines.push('', `## Codebase Context\n${map}`);
-    pad.keyFindings.push(`Codebase mapped at ${repoRoot}`);
-    // Also load repo instructions
-    for (const file of ['AGENTS.md', 'CLAUDE.md', '.cursorrules']) {
-      const result = await readFileFromContainer(`${repoRoot}/${file}`);
-      if (result.exitCode === 0 && result.stdout) {
-        envLines.push('', `## ${file}\n${result.stdout.slice(0, 800)}`);
-        break;
-      }
-    }
-  }
-  envLines.push('', `## Task\n${task.goal}`);
-  history.push(userText(envLines.join('\n')));
+  if (isTaskCancelled(task.id)) { clearAgentAssignment('Forge'); return; }
 
-  let lastProcessedInputTime = task.createdAt - 1;
-  let consecutiveNoProgress = 0;
-  let lastToolSig = '';
-
-  for (let i = 1; i <= maxIterations; i++) {
-    if (isTaskCancelled(task.id)) { clearAgentAssignment('Forge'); return; }
-
-    // Aggressive context compaction
-    if (i > 1 && i % SUMMARIZE_EVERY === 0) {
-      history.splice(0, history.length, ...compactHistory(history, pad));
-    }
-
-    incrementTaskIterations(task.id);
-    const currentTask = getTask(task.id);
-    const nextSteps = (currentTask?.totalAgentSteps || 0) + 1;
-    updateTask(task.id, { totalAgentSteps: nextSteps });
-    if (nextSteps > MAX_TOTAL_AGENT_STEPS) {
-      updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: `Step budget reached (${MAX_TOTAL_AGENT_STEPS}).` });
-      clearAgentAssignment('Forge');
-      return;
-    }
-
-    // Check for user input
-    const newInputs = getMemoryForTask(task.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
-    for (const input of newInputs) {
-      history.push(userText(`USER INPUT: ${input.content}`));
-      lastProcessedInputTime = Math.max(lastProcessedInputTime, input.createdAt);
-    }
-
-    let response;
-    try {
-      response = await callLLMWithTools(systemPrompt, history, WORKER_TOOLS, 'gemini-2.5-flash');
-    } catch (err: any) {
-      saveMemory(task.id, 'error', `LLM error: ${err.message}`, null, 'working');
-      continue;
-    }
-
-    const { thought, toolCalls } = response;
-
-    // Progress detection
-    const toolSig = toolCalls.map(c => `${c.name}:${JSON.stringify(c.args).slice(0, 80)}`).join('|');
-    if (toolSig === lastToolSig && toolSig !== '') {
-      consecutiveNoProgress++;
-    } else {
-      consecutiveNoProgress = 0;
-    }
-    lastToolSig = toolSig;
-
-    // Reflection-before-retry: nudge strategy change at halfway point
-    if (consecutiveNoProgress === 2) {
-      history.push(userText('STOP: You are repeating the same action. Your previous approach failed. Analyze WHY it failed and try a completely different strategy. Do NOT retry the same tool with the same arguments.'));
-    }
-
-    if (consecutiveNoProgress >= MAX_NO_PROGRESS) {
-      updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: 'Stalled: repeating same actions.' });
-      clearAgentAssignment('Forge');
-      return;
-    }
-
-    if (thought) {
-      console.log(`[Tool] Step ${i}: ${thought.slice(0, 100)}`);
-      saveMemory(task.id, 'thought', thought.slice(0, 300), null, 'working');
-    }
-
-    // No tool calls - nudge
-    if (toolCalls.length === 0) {
-      history.push({ role: 'model', parts: [{ text: thought || '(thinking)' }] });
-      history.push(userText('Call a tool to proceed or task_done if complete.'));
-      continue;
-    }
-
-    // Log tool calls to memory for frontend visibility
-    for (const call of toolCalls) {
-      const argSummary = call.name === 'run_shell' ? `$ ${call.args.command}` :
-        call.name === 'read_file' ? call.args.path :
-        call.name === 'write_file' || call.name === 'str_replace_file' ? call.args.path || call.args.file :
-        call.name === 'multi_edit' ? `${(call.args.operations || []).length} operations` :
-        JSON.stringify(call.args).slice(0, 80);
-      saveMemory(task.id, 'command', `[${call.name}] ${argSummary}`, null, 'working');
-    }
-
-    console.log(`[Tool] Step ${i}: ${toolCalls.length} tool(s): ${toolCalls.map(c => c.name).join(', ')}`);
-
-    // Execute all tool calls in parallel
-    const execResults = await Promise.all(toolCalls.map(async (call) => {
-      return executeToolCallForMode(call, {
-        taskId: task.id, subTaskId: null, cwd: currentWorkingDirectory,
-        pad, previousShell: previousShellResults, strReplaceFailures: strReplaceFailuresByFile,
-      });
-    }));
-
-    // Check for terminal actions
-    let terminated = false;
-    for (let j = 0; j < execResults.length; j++) {
-      const r = execResults[j];
-      if (r.newCwd !== undefined) currentWorkingDirectory = r.newCwd;
-
-      if (r.done) {
-        // Build verification
-        if (currentWorkingDirectory) {
-          const buildCheck = await runBuildVerification(currentWorkingDirectory);
-          if (!buildCheck.passed) {
-            execResults[j] = { ...r, result: `Build failed. Fix before completing:\n${buildCheck.output}` };
-            break; // Don't terminate, push result and continue
-          }
-        }
-        if (!isTaskCancelled(task.id)) {
-          updateTask(task.id, { status: 'done', completedAt: Date.now(), result: r.summary || 'Completed.' });
-        }
+  if (result.success) {
+    // Run build verification
+    const buildCheck = await runBuildVerification(workDir);
+    if (!buildCheck.passed) {
+      // One more Aider attempt with build errors as context
+      saveMemory(task.id, 'error', `Build failed after Aider: ${buildCheck.output.slice(0, 500)}`, null, 'working');
+      const fixResult = await executeWithAider(
+        `${task.goal}\n\nBUILD FAILED. Fix these errors:\n${buildCheck.output}`,
+        workDir, task.id, null, 1
+      );
+      if (!fixResult.success || !(await runBuildVerification(workDir)).passed) {
+        updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: `Build still failing after fix attempt.` });
         clearAgentAssignment('Forge');
-        terminated = true;
-        break;
-      }
-
-      if (r.askUser) {
-        saveMemory(task.id, 'thought', `WAITING: ${r.askUser}`, null, 'working');
-        lastProcessedInputTime = await waitForUserInput(task.id, null, lastProcessedInputTime);
-        i--;
-        terminated = true;
-        break;
+        return;
       }
     }
 
-    // Add to history using native protocol (functionCall + functionResponse parts)
-    history.push(modelToolCalls(toolCalls, thought));
-    history.push(toolResultParts(execResults.map((r, k) => ({
-      name: toolCalls[k].name,
-      result: r.result,
-    }))));
-
-    // Log key tool results to memory for frontend
-    for (let k = 0; k < execResults.length; k++) {
-      const r = execResults[k];
-      if (r.done || r.askUser) continue; // Already logged
-      const resultSnippet = r.result.slice(0, 200);
-      if (r.result.includes('FAIL') || r.result.includes('Error') || r.result.includes('exit 1')) {
-        saveMemory(task.id, 'error', `[${toolCalls[k].name}] ${resultSnippet}`, null, 'working');
-      }
-    }
-
-    if (terminated) {
-      if (getTask(task.id)?.status === 'done') return;
-      continue;
-    }
-  }
-
-  if (!isTaskCancelled(task.id)) {
-    updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: `Iteration limit (${maxIterations}).` });
+    const summary = result.filesChanged.length > 0
+      ? `Completed. Files changed: ${result.filesChanged.join(', ')}`
+      : 'Completed successfully.';
+    updateTask(task.id, { status: 'done', completedAt: Date.now(), result: summary });
+  } else {
+    updateTask(task.id, { status: 'failed', completedAt: Date.now(), error: `Aider failed after retries. Last output: ${result.output.slice(-300)}` });
   }
   clearAgentAssignment('Forge');
 }
@@ -1703,160 +1554,47 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
   await ensureWorkspaceReady();
   await syncRuntimeSecretsToContainer();
 
-  const preinstalled = await getPreinstalledPackages();
   const repoRoot = await resolveKnownRepoRoot(task, subTask);
-  let cwd: string | null = repoRoot;
+  const workDir = repoRoot || '/workspace';
 
-  const artifacts = getArtifactsForTask(task.id);
-  const systemPrompt = getSystemPrompt('worker', { task, subTask, artifacts });
-  const history: GeminiContent[] = [];
-  const pad = newScratchpad();
-  const previousShell = new Map<string, string>();
-  const strReplaceFailures = new Map<string, number>();
+  // Build goal with full context for Aider
+  const aiderGoal = [
+    `Task: ${subTask.title}`,
+    subTask.description,
+    subTask.successCriteria.length > 0 ? `Success Criteria: ${subTask.successCriteria.join('; ')}` : '',
+    `Parent goal: ${task.goal}`,
+  ].filter(Boolean).join('\n');
 
-  // Build efficient initial context
-  const envLines = [
-    `## Environment (pre-installed): Node: ${preinstalled.npm.join(', ')} | Python: ${preinstalled.pip.join(', ')}`,
-  ];
-  if (repoRoot) {
-    const map = await buildRepoFingerprint(repoRoot);
-    if (map) envLines.push(`## Codebase\n${map}`);
-    pad.keyFindings.push(`Mapped ${repoRoot}`);
+  // Delegate to Aider
+  const result = await executeWithAider(aiderGoal, workDir, task.id, subTask.id, 3);
+
+  if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
+    clearAgentAssignment(assignedAgent);
+    return;
   }
-  envLines.push(`## Milestone: ${subTask.title}`, subTask.description, `Success Criteria: ${subTask.successCriteria.join(', ')}`);
-  history.push(userText(envLines.join('\n')));
 
-  let lastProcessedInputTime = subTask.createdAt - 1;
-  let consecutiveNoProgress = 0;
-  let lastToolSig = '';
-
-  for (let i = 1; i <= MAX_ITERATIONS_PER_SUBTASK; i++) {
-    if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) { clearAgentAssignment(assignedAgent); return; }
-
-    if (i > 1 && i % SUMMARIZE_EVERY === 0) {
-      history.splice(0, history.length, ...compactHistory(history, pad));
-    }
-
-    incrementTaskIterations(task.id);
-    const currentTask = getTask(task.id);
-    if (currentTask) updateTask(task.id, { totalAgentSteps: (currentTask.totalAgentSteps || 0) + 1 });
-
-    // User input
-    const newInputs = getMemoryForSubTask(subTask.id).filter(m => m.type === 'input' && m.createdAt > lastProcessedInputTime);
-    for (const input of newInputs) {
-      history.push(userText(`USER INPUT: ${input.content}`));
-      lastProcessedInputTime = Math.max(lastProcessedInputTime, input.createdAt);
-    }
-
-    let response;
-    try {
-      response = await callLLMWithTools(systemPrompt, history, WORKER_TOOLS, 'gemini-2.5-flash');
-    } catch (err: any) {
-      saveMemory(task.id, 'error', `LLM error: ${err.message}`, subTask.id, 'working');
-      continue;
-    }
-
-    const { thought, toolCalls } = response;
-
-    // Progress detection
-    const toolSig = toolCalls.map(c => `${c.name}:${JSON.stringify(c.args).slice(0, 60)}`).join('|');
-    if (toolSig === lastToolSig && toolSig !== '') { consecutiveNoProgress++; } else { consecutiveNoProgress = 0; }
-    lastToolSig = toolSig;
-
-    // Reflection-before-retry
-    if (consecutiveNoProgress === 2) {
-      history.push(userText('STOP: You are repeating the same action. Analyze WHY it failed and try a completely different strategy.'));
-    }
-
-    if (consecutiveNoProgress >= MAX_NO_PROGRESS) {
-      updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Stalled' });
-      clearAgentAssignment(assignedAgent);
-      return;
-    }
-
-    if (thought) {
-      console.log(`[Worker:${subTask.title}] Step ${i}: ${thought.slice(0, 80)}`);
-      saveMemory(task.id, 'thought', `[${subTask.title}] ${thought.slice(0, 300)}`, subTask.id, 'working');
-    }
-
-    if (toolCalls.length === 0) {
-      history.push({ role: 'model', parts: [{ text: thought || '(thinking)' }] });
-      history.push(userText('Call a tool or task_done.'));
-      continue;
-    }
-
-    // Log tool calls to memory for frontend visibility
-    for (const call of toolCalls) {
-      const argSummary = call.name === 'run_shell' ? `$ ${call.args.command}` :
-        call.name === 'read_file' ? call.args.path :
-        call.name === 'write_file' || call.name === 'str_replace_file' ? call.args.path || call.args.file :
-        call.name === 'multi_edit' ? `${(call.args.operations || []).length} operations` :
-        JSON.stringify(call.args).slice(0, 80);
-      saveMemory(task.id, 'command', `[${call.name}] ${argSummary}`, subTask.id, 'working');
-    }
-
-    console.log(`[Worker:${subTask.title}] ${toolCalls.length} tool(s): ${toolCalls.map(c => c.name).join(', ')}`);
-
-    // Execute tools in parallel
-    const execResults = await Promise.all(toolCalls.map(call =>
-      executeToolCallForMode(call, { taskId: task.id, subTaskId: subTask.id, cwd, pad, previousShell, strReplaceFailures })
-    ));
-
-    let terminated = false;
-    for (let j = 0; j < execResults.length; j++) {
-      const r = execResults[j];
-      if (r.newCwd !== undefined) cwd = r.newCwd;
-
-      if (r.done) {
-        if (cwd) {
-          const buildCheck = await runBuildVerification(cwd);
-          if (!buildCheck.passed) {
-            execResults[j] = { ...r, result: `Build failed:\n${buildCheck.output}` };
-            break;
-          }
-        }
-        const { artifacts: arts = [] } = toolCalls[j].args;
-        for (const art of arts) {
-          createArtifact({ taskId: task.id, name: art.name, type: art.type || 'unknown', content: art.content || '', producerSubTaskId: subTask.id });
-        }
-        if (!isSubTaskCancelled(subTask.id)) {
-          updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: r.summary });
-        }
+  if (result.success) {
+    // Build verification
+    const buildCheck = await runBuildVerification(workDir);
+    if (!buildCheck.passed) {
+      // One more attempt with build errors
+      const fixResult = await executeWithAider(
+        `${aiderGoal}\n\nBUILD FAILED after your changes. Fix:\n${buildCheck.output}`,
+        workDir, task.id, subTask.id, 1
+      );
+      if (!fixResult.success || !(await runBuildVerification(workDir)).passed) {
+        updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Build failing after Aider edits.' });
         clearAgentAssignment(assignedAgent);
-        terminated = true;
-        break;
-      }
-
-      if (r.askUser) {
-        updateSubTask(subTask.id, { status: 'waiting_for_human' });
-        await waitForUserInput(task.id, subTask.id, lastProcessedInputTime);
-        updateSubTask(subTask.id, { status: 'running' });
-        i--;
-        terminated = true;
-        break;
+        return;
       }
     }
 
-    history.push(modelToolCalls(toolCalls, thought));
-    history.push(toolResultParts(execResults.map((r, k) => ({ name: toolCalls[k].name, result: r.result }))));
-
-    // Log key tool results to memory for frontend
-    for (let k = 0; k < execResults.length; k++) {
-      const r = execResults[k];
-      if (r.done || r.askUser) continue;
-      if (r.result.includes('FAIL') || r.result.includes('Error') || r.result.includes('exit 1')) {
-        saveMemory(task.id, 'error', `[${toolCalls[k].name}] ${r.result.slice(0, 200)}`, subTask.id, 'working');
-      }
-    }
-
-    if (terminated) {
-      if (getSubTask(subTask.id)?.status === 'done') return;
-      continue;
-    }
-  }
-
-  if (!isSubTaskCancelled(subTask.id)) {
-    updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: 'Max iterations' });
+    const summary = result.filesChanged.length > 0
+      ? `Completed ${subTask.title}. Files: ${result.filesChanged.join(', ')}`
+      : `Completed ${subTask.title}.`;
+    updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: summary });
+  } else {
+    updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: `Aider failed: ${result.output.slice(-200)}` });
   }
   clearAgentAssignment(assignedAgent);
 }

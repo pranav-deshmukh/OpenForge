@@ -171,7 +171,8 @@ RUN pip3 install --break-system-packages --no-cache-dir \\
     pytest \\
     black \\
     httpx \\
-    python-dotenv
+    python-dotenv \\
+    aider-chat
 
 # Mark what's pre-installed so the agent knows not to reinstall
 RUN echo "typescript ts-node nodemon prettier eslint tsx jest http-server" > /etc/openforge-preinstalled-npm && \\
@@ -221,6 +222,7 @@ async function startContainer(): Promise<void> {
     '-p', '4000-4010:4000-4010',
     '-e', `TAVILY_API_KEY=${process.env.TAVILY_API_KEY ?? ''}`,
     '-e', `OPENROUTER_API_KEY=${process.env.OPENROUTER_API_KEY ?? ''}`,
+    '-e', `GEMINI_API_KEY=${process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY ?? ''}`,
     WORKSPACE_IMAGE,
   ], { quiet: true });
 
