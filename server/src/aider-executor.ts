@@ -19,7 +19,6 @@ const AIDER_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max per invocation
 const AIDER_BASE_FLAGS = [
   '--model', 'gemini/gemini-2.5-flash',
   '--yes-always',
-  '--no-git',
   '--no-pretty',
   '--no-stream',
   '--no-detect-urls',
@@ -52,7 +51,9 @@ export async function runAiderTask(
 
   const messageArg = `--message ${shellQuote(goal)}`;
 
-  const command = `cd ${shellQuote(workDir)} && aider ${AIDER_BASE_FLAGS} ${fileArgs} ${messageArg} 2>&1`;
+  // Ensure workDir exists with a git repo (Aider requires one), set git identity, then run Aider
+  const gitSetup = `mkdir -p ${shellQuote(workDir)} && cd ${shellQuote(workDir)} && git init -q 2>/dev/null; git config user.email 'agent@openforge.local' 2>/dev/null; git config user.name 'OpenForge Agent' 2>/dev/null;`;
+  const command = `${gitSetup} aider ${AIDER_BASE_FLAGS} ${fileArgs} ${messageArg} 2>&1`;
 
   if (taskId) {
     saveMemory(taskId, 'command', `[aider] ${goal.slice(0, 150)}`, subTaskId ?? null, 'working');
@@ -87,6 +88,7 @@ export async function runAiderTask(
 /**
  * Discover relevant files for a task goal by searching the workspace.
  * Returns up to maxFiles paths that are likely relevant.
+ * Skips searching if workDir doesn't exist or is empty.
  */
 export async function discoverRelevantFiles(
   goal: string,
@@ -95,11 +97,26 @@ export async function discoverRelevantFiles(
 ): Promise<string[]> {
   const files: Set<string> = new Set();
 
-  // 1. Extract explicit file paths/names from the goal
+  // Pre-check: does workDir exist and have any files?
+  const dirCheck = await execInContainer(
+    `test -d ${shellQuote(workDir)} && find ${shellQuote(workDir)} -maxdepth 1 -type f 2>/dev/null | head -1`,
+    5000,
+  );
+  const workDirExists = dirCheck.exitCode === 0;
+  const workDirHasFiles = workDirExists && dirCheck.stdout.trim().length > 0;
+
+  if (!workDirExists) {
+    console.log(`[Aider] workDir ${workDir} does not exist yet — skipping file discovery`);
+    return [];
+  }
+
+  // 1. Extract explicit file paths/names from the goal (files only, not directories)
   const pathMatches = goal.match(/(?:\/workspace\/|\.\/|src\/|app\/)[^\s,;)'"]+/g) || [];
   for (const p of pathMatches) {
     const fullPath = p.startsWith('/') ? p : `${workDir}/${p}`;
-    if (await pathExistsInContainer(fullPath)) {
+    // Only add if it's a file, not a directory
+    const fileCheck = await execInContainer(`test -f ${shellQuote(fullPath)} && echo yes`, 5000);
+    if (fileCheck.exitCode === 0 && fileCheck.stdout.trim() === 'yes') {
       files.add(fullPath);
     }
   }
@@ -118,16 +135,19 @@ export async function discoverRelevantFiles(
     }
   }
 
-  // 3. Extract keywords and search for relevant code
-  const keywords = extractKeywords(goal);
-  for (const keyword of keywords.slice(0, 3)) {
-    const r = await searchCodeInContainer(workDir, keyword);
-    if (r.exitCode === 0 && r.stdout.trim()) {
-      const matchedFiles = r.stdout.trim().split('\n')
-        .map(line => line.split(':')[0])
-        .filter(Boolean);
-      for (const f of matchedFiles.slice(0, 3)) {
-        files.add(f);
+  // 3. Only search code if there are actual files in the workspace
+  if (workDirHasFiles) {
+    const keywords = extractKeywords(goal);
+    for (const keyword of keywords.slice(0, 3)) {
+      const r = await execInContainer(
+        `timeout 10 rg -l --hidden --glob '!**/.git/**' --glob '!**/node_modules/**' ${shellQuote(keyword)} ${shellQuote(workDir)} 2>/dev/null | head -5`,
+        15000,
+      );
+      if (r.exitCode === 0 && r.stdout.trim()) {
+        const matchedFiles = r.stdout.trim().split('\n').filter(Boolean);
+        for (const f of matchedFiles.slice(0, 3)) {
+          files.add(f);
+        }
       }
     }
   }

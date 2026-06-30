@@ -260,13 +260,19 @@ For GitHub: curl + API with \$GH_TOKEN (not gh CLI).`;
       if (!subTask) throw new Error('Verifier requires a subTask');
       return `You are Crucible, the verifier agent. Your job is to validate the output of the worker agent for the following SubTask:
 Title: ${subTask.title}
-Success Criteria: ${subTask.successCriteria.join(', ')}
-${commonContext}
+Description: ${subTask.description || 'None'}
+SubTask Success Criteria: ${subTask.successCriteria.join('; ')}
+
+Parent Goal (for context only): ${task.goal}
+
+IMPORTANT: Verify ONLY against the SubTask's own success criteria listed above.
+This subtask is ONE step in a larger plan. Do NOT fail it for missing work that belongs to other subtasks.
+
 Worker's Summary: ${subTask.result}
 
 Respond ONLY in this exact JSON format:
 {
-  "thought": "Your analysis of the worker's output against success criteria. Check produced artifacts.",
+  "thought": "Your analysis of the worker's output against the subtask success criteria.",
   "passed": true|false,
   "feedback": "Detailed justification or explanation of what failed.",
   "metrics": {
@@ -285,13 +291,21 @@ If it passes, the task will move to the critique phase. If it fails, it will be 
       return `You are Crucible, the code quality critic. Your job is to review the work done for the following SubTask:
 Title: ${subTask.title}
 Type: ${subTask.type}
-${commonContext}
+Description: ${subTask.description || 'None'}
+SubTask Success Criteria: ${(subTask.successCriteria || []).join('; ') || 'None specified'}
+
+Parent Goal (for context only): ${task.goal}
+
+IMPORTANT: Evaluate ONLY against the SubTask's own scope, title, description, and success criteria above.
+Do NOT fail a subtask because the parent goal is incomplete — other subtasks handle the remaining work.
+The subtask is ONE step in a larger plan. Judge it only on what IT was supposed to accomplish.
+
 Worker's Summary: ${subTask.result}
 
 Review for:
-1. Architecture alignment and technical debt.
-2. Maintainability and readability.
-3. Edge cases and error handling.
+1. Whether the subtask's own success criteria are met.
+2. Code quality and correctness within scope.
+3. Maintainability and readability.
 4. Best practices for ${subTask.type}.
 
 Respond ONLY in this exact JSON format:
@@ -308,7 +322,7 @@ Respond ONLY in this exact JSON format:
   }
 }
 
-High-quality code is mandatory. Do not be afraid to fail a task that is messy or suboptimal.`;
+Pass the subtask if it fulfills its own scope. Do not penalize for work that belongs to other subtasks.`;
 
     case 'security':
       return `You are Sentry, the security agent. Your job is to review proposed shell commands for safety and security.
