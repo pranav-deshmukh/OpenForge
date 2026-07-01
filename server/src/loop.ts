@@ -19,7 +19,7 @@ import { executeWithAider } from './aider-executor.js';
 import { 
   saveMemory, updateTask, getTask, getMemoryForTask, 
   createSubTask, updateSubTask, getSubTasksForTask, getSubTask,
-  createArtifact, getArtifactsForTask, createReflection,
+  createArtifact, getArtifactsForTask, createReflection, getReflectionsForSubTask,
   getMemoryForSubTask, incrementTaskIterations,
   getAgentKnowledge, setAgentKnowledge, listAgentKnowledge, deleteAgentKnowledge
 } from './memory.js';
@@ -49,7 +49,7 @@ const MAX_INITIAL_SUBTASKS = 8;
 const MAX_NO_PROGRESS = 4;
 const MAX_TOTAL_AGENT_STEPS = parsePositiveIntEnv('MAX_TOTAL_AGENT_STEPS', 250);
 const MAX_REPLAN_ATTEMPTS = 2;
-const MAX_RETRIES_PER_TASK = 2;
+const MAX_RETRIES_PER_TASK = 3;
 const MAX_TOOL_OUTPUT_CHARS = 4000; // Tight limit prevents context bloat
 const MAX_STR_REPLACE_FAILURES_PER_FILE = 2;
 const SUMMARIZE_EVERY = 8; // Aggressive context compaction
@@ -304,8 +304,15 @@ function getSubTaskAgentId(subTask: SubTask): AgentId {
 }
 
 function hasRequiredArtifacts(task: Task, subTask: SubTask): boolean {
-  const artifactNames = new Set(getArtifactsForTask(task.id).map((artifact) => artifact.name));
-  return subTask.inputArtifacts.every((artifactName) => artifactNames.has(artifactName));
+  // Artifact registration was never implemented in the worker flow, so inputArtifacts
+  // would always block downstream tasks. Dependencies already enforce ordering.
+  if (subTask.inputArtifacts.length === 0) return true;
+  // Check if all dependency subtasks that produce these artifacts are done
+  const subTasks = getSubTasksForTask(task.id);
+  return subTask.dependencies.every(depId => {
+    const dep = subTasks.find(s => s.id === depId);
+    return dep && dep.status === 'done';
+  });
 }
 
 function calculateDagDepth(subTasks: SubTask[]): number {
@@ -1554,19 +1561,100 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
   await ensureWorkspaceReady();
   await syncRuntimeSecretsToContainer();
 
-  const repoRoot = await resolveKnownRepoRoot(task, subTask);
-  const workDir = repoRoot || '/workspace';
+  // Determine workDir: prefer the most specific workspaceScope path, fallback to repoRoot
+  let workDir = '/workspace';
+  
+  // Extract the project root from the task goal (e.g., "/workspace/shortener" from "in /workspace/shortener")
+  const goalPathMatch = task.goal.match(/(?:in|into|at)\s+(\/workspace\/[\w-]+)/i);
+  const projectRoot = goalPathMatch ? goalPathMatch[1] : null;
+  // e.g., "shortener" from "/workspace/shortener"
+  const projectName = projectRoot ? projectRoot.split('/').pop() : null;
+  
+  if (subTask.workspaceScope && subTask.workspaceScope.length > 0) {
+    const scope = subTask.workspaceScope[0];
+    let scopePath: string;
+    if (scope.startsWith('/')) {
+      scopePath = scope;
+    } else if (projectRoot && projectName && !scope.startsWith(projectName)) {
+      // Scope is relative without project prefix (e.g., "backend") — prepend project root
+      scopePath = `${projectRoot}/${scope}`;
+    } else {
+      // Scope already includes project name (e.g., "shortener/backend") or no project root
+      scopePath = `/workspace/${scope}`;
+    }
+    // Ensure the directory exists
+    await execInContainer(`mkdir -p ${JSON.stringify(scopePath)}`);
+    workDir = scopePath;
+  } else if (projectRoot) {
+    await execInContainer(`mkdir -p ${JSON.stringify(projectRoot)}`);
+    workDir = projectRoot;
+  } else {
+    const repoRoot = await resolveKnownRepoRoot(task, subTask);
+    workDir = repoRoot || '/workspace';
+  }
+
+  // Pre-execution: handle filesystem operations that Aider can't do (delete/move dirs)
+  const fsOpsPattern = /(?:rm\s+-rf|remove|delete)\s+(\/workspace\/[\w\-\/]+)/gi;
+  const descText = `${subTask.title} ${subTask.description}`;
+  let fsMatch;
+  while ((fsMatch = fsOpsPattern.exec(descText)) !== null) {
+    const targetPath = fsMatch[1];
+    if (targetPath.startsWith('/workspace/') && !targetPath.includes('..')) {
+      console.log(`[Worker] Pre-exec: removing ${targetPath}`);
+      await execInContainer(`rm -rf ${JSON.stringify(targetPath)}`);
+    }
+  }
+  // Also handle explicit directory removal patterns like "Remove /workspace/shortener/server/"
+  const removeDirPattern = /(?:remove|delete|clean up)\s+(?:the\s+)?(?:stale\s+)?(?:directories?\s+)?[`'"]?(\/workspace\/[\w\-\/]+)[`'"]?/gi;
+  while ((fsMatch = removeDirPattern.exec(descText)) !== null) {
+    const targetPath = fsMatch[1];
+    if (targetPath.startsWith('/workspace/') && !targetPath.includes('..')) {
+      console.log(`[Worker] Pre-exec: removing ${targetPath}`);
+      await execInContainer(`rm -rf ${JSON.stringify(targetPath)}`);
+    }
+  }
 
   // Build goal with full context for Aider
-  const aiderGoal = [
+  const goalParts = [
     `Task: ${subTask.title}`,
     subTask.description,
     subTask.successCriteria.length > 0 ? `Success Criteria: ${subTask.successCriteria.join('; ')}` : '',
     `Parent goal: ${task.goal}`,
-  ].filter(Boolean).join('\n');
+  ];
+
+  // On retry, inject previous failure context so Aider knows what to fix
+  if (subTask.retryCount > 0) {
+    const reflections = getReflectionsForSubTask(subTask.id);
+    const lastError = subTask.error || subTask.critique || 'Unknown failure';
+    goalParts.push(`\n## PREVIOUS ATTEMPT FAILED (attempt ${subTask.retryCount})`);
+    goalParts.push(`Failure reason: ${lastError}`);
+    if (reflections.length > 0) {
+      const lastReflection = reflections[reflections.length - 1];
+      goalParts.push(`Reflection: ${lastReflection.content}`);
+    }
+    goalParts.push(`\nDo NOT repeat the same approach. Fix the issues described above.`);
+  }
+
+  const aiderGoal = goalParts.filter(Boolean).join('\n');
 
   // Delegate to Aider
-  const result = await executeWithAider(aiderGoal, workDir, task.id, subTask.id, 3);
+  let result = await executeWithAider(aiderGoal, workDir, task.id, subTask.id, 3);
+
+  // If Aider changed nothing, retry once with a more forceful prompt
+  if (result.success && result.filesChanged.length === 0) {
+    console.log(`[Worker] Aider changed 0 files for "${subTask.title}" — retrying with explicit instruction`);
+    const dirListing = await execInContainer(
+      `find ${JSON.stringify(workDir)} -type f -not -path '*/.git/*' -not -path '*/.aider*' -not -path '*/node_modules/*' 2>/dev/null | head -20`
+    );
+    const forcePrompt = [
+      aiderGoal,
+      `\n## IMPORTANT: You MUST make changes.`,
+      `Your previous attempt changed 0 files. This task requires actual code changes.`,
+      `The current files in the workspace are:\n${dirListing.stdout || '(empty)'}`,
+      `You MUST create or modify files to complete this task. Do not just acknowledge — write the code.`,
+    ].join('\n');
+    result = await executeWithAider(forcePrompt, workDir, task.id, subTask.id, 3);
+  }
 
   if (isTaskCancelled(task.id) || isSubTaskCancelled(subTask.id)) {
     clearAgentAssignment(assignedAgent);
@@ -1589,9 +1677,44 @@ async function runWorkerAgent(task: Task, subTask: SubTask) {
       }
     }
 
-    const summary = result.filesChanged.length > 0
+    // Build a rich summary including file contents so the Verifier can actually check them
+    let summary = result.filesChanged.length > 0
       ? `Completed ${subTask.title}. Files: ${result.filesChanged.join(', ')}`
-      : `Completed ${subTask.title}.`;
+      : `Completed ${subTask.title}. WARNING: No files were changed by Aider.`;
+
+    if (result.filesChanged.length > 0) {
+      const fileContents: string[] = [];
+      // Also include key config files even if not in filesChanged list
+      const filesToCheck = [...result.filesChanged.slice(0, 8)];
+      const keyFiles = ['package.json', 'tsconfig.json', 'next.config.js', 'next.config.ts'];
+      for (const kf of keyFiles) {
+        if (!filesToCheck.some(f => f.endsWith(kf))) {
+          const kfPath = `${workDir}/${kf}`;
+          const exists = await execInContainer(`test -f ${JSON.stringify(kfPath)} && echo yes`);
+          if (exists.exitCode === 0 && exists.stdout.trim() === 'yes') {
+            filesToCheck.push(kf);
+          }
+        }
+      }
+      for (const f of filesToCheck.slice(0, 10)) { // Limit to 10 files
+        const filePath = f.startsWith('/') ? f : `${workDir}/${f}`;
+        const content = await readFileFromContainer(filePath);
+        if (content.exitCode === 0 && content.stdout.length < 8000) {
+          fileContents.push(`\n--- File: ${f} ---\n${content.stdout}`);
+        } else if (content.exitCode === 0) {
+          fileContents.push(`\n--- File: ${f} (first 200 lines) ---\n${content.stdout.split('\n').slice(0, 200).join('\n')}`);
+        }
+      }
+      if (fileContents.length > 0) {
+        summary += '\n\n## File Contents' + fileContents.join('\n');
+      }
+    } else {
+      // No files changed — include directory listing so verifier can assess existing state
+      const dirListing = await execInContainer(`find ${JSON.stringify(workDir)} -type f -not -path '*/.git/*' -not -path '*/.aider*' -not -path '*/node_modules/*' 2>/dev/null | head -30`);
+      if (dirListing.exitCode === 0 && dirListing.stdout.trim()) {
+        summary += `\n\n## Existing Files in ${workDir}:\n${dirListing.stdout}`;
+      }
+    }
     updateSubTask(subTask.id, { status: 'done', completedAt: Date.now(), result: summary });
   } else {
     updateSubTask(subTask.id, { status: 'failed', completedAt: Date.now(), error: `Aider failed: ${result.output.slice(-200)}` });
@@ -1768,7 +1891,7 @@ async function handleSubTaskFailure(task: Task, subTask: SubTask, phase: string)
       status: 'retrying', 
       retryCount: subTask.retryCount + 1 
     });
-    // Reset status to pending for executor to pick up again
+    // Reset status to pending for executor to pick up again (keep error/critique for retry context)
     updateSubTask(subTask.id, { status: 'pending' });
   } else {
     updateSubTask(subTask.id, { status: 'failed' });
@@ -1829,8 +1952,8 @@ async function reflectAndReplan(task: Task) {
     // Depth check after linking
     const allSubTasks = getSubTasksForTask(task.id);
     const currentDepth = calculateDagDepth(allSubTasks);
-    if (currentDepth > 3) {
-      throw new Error(`Replanning exceeded max DAG depth (3). Current: ${currentDepth}`);
+    if (currentDepth > 5) {
+      throw new Error(`Replanning exceeded max DAG depth (5). Current: ${currentDepth}`);
     }
 
     clearAgentAssignment('Atlas');
